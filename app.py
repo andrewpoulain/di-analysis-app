@@ -65,10 +65,13 @@ st.sidebar.metric("Surface area (m²)", f"{surface:.1f}")
 
 st.sidebar.subheader("Measurement Settings")
 
-transition_hz = st.sidebar.selectbox(
-    "Transition frequency (Hz)", [125, 250, 500], index=1)
 n_taps = st.sidebar.selectbox(
     "FIR filter taps", [512, 1024, 2048, 4096], index=1)
+
+st.sidebar.info(
+    "Transition frequency between gated direct field "
+    "and spatial average is calculated automatically "
+    "from the detected gate length after measurement.")
 
 st.sidebar.header("Channel Configuration")
 
@@ -145,6 +148,23 @@ if uploaded_files and st.button("Run Analysis"):
 
         st.success(f"Loaded {len(irs)} IR files at {ref_fs} Hz")
 
+        # Direct field at reference position
+        direct_levels, gate_ms_used = direct_field_at_bands(
+            ref_ir, ref_fs, gate_ms=gate_ms)
+
+        # Calculate transition frequency from actual gate used
+        # Require at least 2 cycles in the gate window for reliability
+        # Clamp to nearest standard octave band centre
+        transition_hz = max(125, int(2.0 / (gate_ms_used / 1000.0)))
+        # Round up to nearest octave band centre from OCTAVE_CENTRES
+        transition_hz = int(min(
+            [b for b in OCTAVE_CENTRES if b >= transition_hz],
+            default=250))
+
+        st.info(
+            f"Gate detected: {gate_ms_used:.1f} ms — "
+            f"transition frequency set to {transition_hz} Hz")
+
         room_cfg = {
             'volume_m3': volume,
             'surface_area_m2': surface,
@@ -159,29 +179,33 @@ if uploaded_files and st.button("Run Analysis"):
             'hf_shelf_db': hf_shelf_db,
         }
 
-        direct_levels, gate_ms_used = direct_field_at_bands(
-            ref_ir, ref_fs, gate_ms=gate_ms)
-
+        # RT60 per band
         rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
 
+        # Spatially averaged reverberant field
         reverb_levels = spatial_average_reverberant(irs, ref_fs)
 
+        # DI estimate
         di = estimate_di(
             direct_levels, reverb_levels,
             rt60_bands, volume, surface)
 
+        # EQ target derivation
         hf_corr, lf_corr, all_corr, predicted = derive_full_eq_target(
             direct_levels, reverb_levels, reverb_levels,
             rt60_bands, room_cfg, channel_cfg,
             transition_hz=transition_hz)
 
+        # FIR filter design
         fir_coeffs, fir_freq_response = design_fir_filter(
             hf_corr, ref_fs, n_taps=n_taps,
             transition_hz=transition_hz)
 
+        # IIR biquad design
         sos, lf_filter_params = design_lf_iir_filters(
             lf_corr, ref_fs, transition_hz=transition_hz)
 
+        # Generate plots
         plot_analysis(
             direct_levels, reverb_levels, di, rt60_bands,
             gate_ms_used, channel_name, str(out_dir))
@@ -191,12 +215,14 @@ if uploaded_files and st.button("Run Analysis"):
             predicted, fir_freq_response, lf_filter_params,
             channel_name, str(out_dir))
 
+        # Save filter files
         save_fir_coefficients(
             fir_coeffs, channel_name, ref_fs, str(out_dir))
 
         save_iir_parameters(
             lf_filter_params, channel_name, str(out_dir))
 
+        # Save CSV
         df = save_csv(
             direct_levels, reverb_levels, di, rt60_bands,
             all_corr, predicted, channel_name, str(out_dir))
@@ -225,21 +251,31 @@ if uploaded_files and st.button("Run Analysis"):
     st.header("3. Results Table")
     st.dataframe(df)
 
-    st.header("4. RT60 Summary")
+    st.header("4. Measurement Summary")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Gate length", f"{gate_ms_used:.1f} ms")
+    with col2:
+        st.metric("Transition frequency", f"{transition_hz} Hz")
+    with col3:
+        st.metric("IR files processed", len(irs))
+
+    st.header("5. RT60 Summary")
     rt60_display = {
         str(b): f"{v:.3f} s" if v else "n/a"
         for b, v in rt60_bands.items()}
     st.json(rt60_display)
 
     if lf_filter_params:
-        st.header("5. LF IIR Filter Parameters")
+        st.header("6. LF IIR Filter Parameters")
         st.dataframe(pd.DataFrame(lf_filter_params))
 
     # ---------------------------------------------------------------------------
     # Downloads
     # ---------------------------------------------------------------------------
 
-    st.header("6. Download Filter Files")
+    st.header("7. Download Filter Files")
 
     col1, col2, col3, col4 = st.columns(4)
 
