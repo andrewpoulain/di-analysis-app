@@ -8,11 +8,15 @@ import tempfile
 import shutil
 from pathlib import Path
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from di_analysis import (
     load_ir,
     apply_calibration,
     direct_field_at_bands,
+    gated_direct_field,
     rt60_per_band_from_irs,
     spatial_average_reverberant,
     estimate_di,
@@ -25,6 +29,7 @@ from di_analysis import (
     save_iir_parameters,
     save_csv,
     OCTAVE_CENTRES,
+    interpolate_correction_to_freqs,
 )
 
 st.set_page_config(
@@ -90,6 +95,47 @@ hf_shelf_db = st.sidebar.number_input(
     min_value=-6.0, max_value=0.0, value=0.0, step=0.5)
 
 # ---------------------------------------------------------------------------
+# Helper: smooth a spectrum for display
+# ---------------------------------------------------------------------------
+
+def fractional_octave_smooth(freqs, magnitude, fraction=3):
+    """
+    Apply 1/N octave smoothing to a magnitude spectrum for display.
+    fraction=3 gives 1/3 octave smoothing.
+    Returns smoothed magnitude array.
+    """
+    smoothed = np.zeros_like(magnitude)
+    for i, f in enumerate(freqs):
+        if f <= 0:
+            continue
+        f_lo = f / (2 ** (1.0 / (2 * fraction)))
+        f_hi = f * (2 ** (1.0 / (2 * fraction)))
+        mask = (freqs >= f_lo) & (freqs <= f_hi)
+        if mask.sum() > 0:
+            power = 10.0 ** (magnitude[mask] / 10.0)
+            smoothed[i] = 10.0 * np.log10(np.mean(power))
+        else:
+            smoothed[i] = magnitude[i]
+    return smoothed
+
+
+def octave_band_trace(bands_dict, name, colour, dash='solid'):
+    """
+    Build a Plotly scatter trace from an octave band dict.
+    bands_dict: {centre_hz: level_db}
+    """
+    bands_sorted = sorted(bands_dict.keys())
+    x = [float(b) for b in bands_sorted]
+    y = [bands_dict[b] for b in bands_sorted]
+    return go.Scatter(
+        x=x, y=y,
+        mode='lines+markers',
+        name=name,
+        line=dict(color=colour, dash=dash, width=2),
+        marker=dict(size=8))
+
+
+# ---------------------------------------------------------------------------
 # Main panel: file upload
 # ---------------------------------------------------------------------------
 
@@ -148,15 +194,16 @@ if uploaded_files and st.button("Run Analysis"):
 
         st.success(f"Loaded {len(irs)} IR files at {ref_fs} Hz")
 
-        # Direct field at reference position
+        # Direct field
         direct_levels, gate_ms_used = direct_field_at_bands(
             ref_ir, ref_fs, gate_ms=gate_ms)
 
-        # Calculate transition frequency from actual gate used
-        # Require at least 2 cycles in the gate window for reliability
-        # Clamp to nearest standard octave band centre
+        # Full resolution direct field for display
+        freqs_full, direct_full, _ = gated_direct_field(
+            ref_ir, ref_fs, gate_ms=gate_ms)
+
+        # Transition frequency from gate
         transition_hz = max(125, int(2.0 / (gate_ms_used / 1000.0)))
-        # Round up to nearest octave band centre from OCTAVE_CENTRES
         transition_hz = int(min(
             [b for b in OCTAVE_CENTRES if b >= transition_hz],
             default=250))
@@ -179,103 +226,289 @@ if uploaded_files and st.button("Run Analysis"):
             'hf_shelf_db': hf_shelf_db,
         }
 
-        # RT60 per band
+        # RT60
         rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
 
-        # Spatially averaged reverberant field
+        # Reverberant field
         reverb_levels = spatial_average_reverberant(irs, ref_fs)
 
-        # DI estimate
+        # DI
         di = estimate_di(
             direct_levels, reverb_levels,
             rt60_bands, volume, surface)
 
-        # EQ target derivation
+        # EQ target
         hf_corr, lf_corr, all_corr, predicted = derive_full_eq_target(
             direct_levels, reverb_levels, reverb_levels,
             rt60_bands, room_cfg, channel_cfg,
             transition_hz=transition_hz)
 
-        # FIR filter design
+        # FIR filter
         fir_coeffs, fir_freq_response = design_fir_filter(
             hf_corr, ref_fs, n_taps=n_taps,
             transition_hz=transition_hz)
 
-        # IIR biquad design
+        # IIR filters
         sos, lf_filter_params = design_lf_iir_filters(
             lf_corr, ref_fs, transition_hz=transition_hz)
 
-        # Generate plots
+        # Full resolution correction curve for display
+        fir_freqs, fir_mag = fir_freq_response
+
+        # Normalise direct field display to 0 dB at 1 kHz
+        ref_level = direct_levels.get(1000, 0.0) or 0.0
+
+        direct_levels_norm = {
+            b: v - ref_level
+            for b, v in direct_levels.items()}
+        reverb_levels_norm = {
+            b: v - ref_level
+            for b, v in reverb_levels.items()}
+        predicted_norm = {
+            b: v - ref_level
+            for b, v in predicted.items()
+            if not np.isnan(v)}
+
+        # Flat target line at 0 dB across all bands
+        target_flat = {int(b): 0.0 for b in OCTAVE_CENTRES}
+
+        # Smooth full resolution direct field for display
+        mask_display = (freqs_full >= 20) & (freqs_full <= 20000)
+        freqs_display = freqs_full[mask_display]
+        direct_display = direct_full[mask_display]
+        direct_display_norm = direct_display - np.max(direct_display)
+
+        # Apply 1/3 octave smoothing
+        direct_smoothed = fractional_octave_smooth(
+            freqs_display, direct_display_norm, fraction=3)
+
+        # Save filter files
+        save_fir_coefficients(
+            fir_coeffs, channel_name, ref_fs, str(out_dir))
+        save_iir_parameters(
+            lf_filter_params, channel_name, str(out_dir))
+        df = save_csv(
+            direct_levels, reverb_levels, di, rt60_bands,
+            all_corr, predicted, channel_name, str(out_dir))
+
+        # Static plots for download
         plot_analysis(
             direct_levels, reverb_levels, di, rt60_bands,
             gate_ms_used, channel_name, str(out_dir))
-
         plot_eq_and_filter(
             direct_levels, reverb_levels, all_corr,
             predicted, fir_freq_response, lf_filter_params,
             channel_name, str(out_dir))
 
-        # Save filter files
-        save_fir_coefficients(
-            fir_coeffs, channel_name, ref_fs, str(out_dir))
-
-        save_iir_parameters(
-            lf_filter_params, channel_name, str(out_dir))
-
-        # Save CSV
-        df = save_csv(
-            direct_levels, reverb_levels, di, rt60_bands,
-            all_corr, predicted, channel_name, str(out_dir))
-
     # ---------------------------------------------------------------------------
-    # Display results
+    # Main response plot
     # ---------------------------------------------------------------------------
 
-    st.header("2. Analysis Results")
+    st.header("2. Measured Response and Target")
 
-    col1, col2 = st.columns(2)
+    fig_main = go.Figure()
 
-    analysis_img = out_dir / f"{channel_name}_analysis.png"
-    eq_img = out_dir / f"{channel_name}_eq_filter.png"
+    # Full resolution smoothed direct field
+    fig_main.add_trace(go.Scatter(
+        x=freqs_display,
+        y=direct_smoothed,
+        mode='lines',
+        name='Direct field (1/3 oct smoothed)',
+        line=dict(color='steelblue', width=1.5),
+        opacity=0.6))
 
-    if analysis_img.exists():
-        with col1:
-            st.subheader("Reverberant Field Analysis")
-            st.image(str(analysis_img))
+    # Octave band direct field
+    fig_main.add_trace(octave_band_trace(
+        direct_levels_norm,
+        'Direct field (octave bands)',
+        'steelblue'))
 
-    if eq_img.exists():
-        with col2:
-            st.subheader("EQ Target and Filter")
-            st.image(str(eq_img))
+    # Octave band reverberant field
+    fig_main.add_trace(octave_band_trace(
+        reverb_levels_norm,
+        'Reverberant field (spatially averaged)',
+        'firebrick',
+        dash='dash'))
 
-    st.header("3. Results Table")
-    st.dataframe(df)
+    # Predicted steady-state after EQ
+    fig_main.add_trace(octave_band_trace(
+        predicted_norm,
+        'Predicted steady-state after EQ',
+        'darkorange'))
 
-    st.header("4. Measurement Summary")
+    # Flat target
+    fig_main.add_trace(octave_band_trace(
+        target_flat,
+        'Target (flat direct field)',
+        'green',
+        dash='dot'))
 
-    col1, col2, col3 = st.columns(3)
+    fig_main.update_layout(
+        title=f"{channel_name} — Measured Response and Target",
+        xaxis=dict(
+            title='Frequency (Hz)',
+            type='log',
+            tickvals=[63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+            ticktext=['63', '125', '250', '500', '1k',
+                      '2k', '4k', '8k', '16k'],
+            range=[np.log10(50), np.log10(20000)]),
+        yaxis=dict(
+            title='Level (dB, normalised at 1 kHz)',
+            range=[-20, 10]),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=-0.3,
+            xanchor='left',
+            x=0),
+        height=500,
+        hovermode='x unified')
+
+    st.plotly_chart(fig_main, use_container_width=True)
+
+    # ---------------------------------------------------------------------------
+    # EQ correction and filter plot
+    # ---------------------------------------------------------------------------
+
+    st.header("3. EQ Correction and Filter Response")
+
+    fig_eq = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            'EQ Correction per Octave Band',
+            'FIR Filter Frequency Response'))
+
+    # EQ correction bars
+    bands_sorted = sorted(all_corr.keys())
+    corr_vals = [all_corr[b] for b in bands_sorted]
+    colours = ['tomato' if v < 0 else 'steelblue'
+               for v in corr_vals]
+
+    fig_eq.add_trace(
+        go.Bar(
+            x=[str(b) for b in bands_sorted],
+            y=corr_vals,
+            marker_color=colours,
+            name='EQ correction (dB)',
+            showlegend=True),
+        row=1, col=1)
+
+    fig_eq.add_hline(
+        y=0, line_dash='dot',
+        line_color='grey', row=1, col=1)
+
+    # FIR filter response
+    fir_mask = fir_freqs > 20
+    fig_eq.add_trace(
+        go.Scatter(
+            x=fir_freqs[fir_mask],
+            y=fir_mag[fir_mask],
+            mode='lines',
+            name='FIR filter response',
+            line=dict(color='darkorange', width=1.5)),
+        row=1, col=2)
+
+    fig_eq.add_hline(
+        y=0, line_dash='dot',
+        line_color='grey', row=1, col=2)
+
+    fig_eq.update_xaxes(
+        type='log',
+        tickvals=[63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+        ticktext=['63', '125', '250', '500', '1k',
+                  '2k', '4k', '8k', '16k'],
+        row=1, col=2)
+
+    fig_eq.update_yaxes(
+        title_text='Correction (dB)', row=1, col=1)
+    fig_eq.update_yaxes(
+        title_text='Filter magnitude (dB)', row=1, col=2)
+
+    fig_eq.update_layout(height=400)
+
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    # ---------------------------------------------------------------------------
+    # RT60 and DI plots
+    # ---------------------------------------------------------------------------
+
+    st.header("4. RT60 and Directivity Index")
+
+    fig_rt_di = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            'RT60 per Octave Band',
+            'Estimated Directivity Index DI(f)'))
+
+    rt60_bands_sorted = sorted(
+        b for b in rt60_bands if rt60_bands[b] is not None)
+    rt60_vals = [rt60_bands[b] for b in rt60_bands_sorted]
+
+    fig_rt_di.add_trace(
+        go.Bar(
+            x=[str(b) for b in rt60_bands_sorted],
+            y=rt60_vals,
+            marker_color='mediumseagreen',
+            name='RT60 (s)'),
+        row=1, col=1)
+
+    di_sorted = sorted(
+        b for b in di if not np.isnan(di.get(b, np.nan)))
+    di_vals = [di[b] for b in di_sorted]
+
+    fig_rt_di.add_trace(
+        go.Scatter(
+            x=[str(b) for b in di_sorted],
+            y=di_vals,
+            mode='lines+markers',
+            name='DI estimate (dB)',
+            line=dict(color='mediumpurple', width=2),
+            marker=dict(size=8)),
+        row=1, col=2)
+
+    fig_rt_di.update_yaxes(
+        title_text='RT60 (s)', row=1, col=1)
+    fig_rt_di.update_yaxes(
+        title_text='DI (dB)', row=1, col=2)
+
+    fig_rt_di.update_layout(height=400)
+
+    st.plotly_chart(fig_rt_di, use_container_width=True)
+
+    # ---------------------------------------------------------------------------
+    # Summary metrics
+    # ---------------------------------------------------------------------------
+
+    st.header("5. Measurement Summary")
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Gate length", f"{gate_ms_used:.1f} ms")
     with col2:
         st.metric("Transition frequency", f"{transition_hz} Hz")
     with col3:
         st.metric("IR files processed", len(irs))
+    with col4:
+        avg_rt60 = np.mean([v for v in rt60_bands.values()
+                            if v is not None])
+        st.metric("Mean RT60", f"{avg_rt60:.2f} s")
 
-    st.header("5. RT60 Summary")
-    rt60_display = {
-        str(b): f"{v:.3f} s" if v else "n/a"
-        for b, v in rt60_bands.items()}
-    st.json(rt60_display)
+    # ---------------------------------------------------------------------------
+    # Results table
+    # ---------------------------------------------------------------------------
+
+    st.header("6. Results Table")
+    st.dataframe(df)
 
     if lf_filter_params:
-        st.header("6. LF IIR Filter Parameters")
+        st.header("7. LF IIR Filter Parameters")
         st.dataframe(pd.DataFrame(lf_filter_params))
 
     # ---------------------------------------------------------------------------
     # Downloads
     # ---------------------------------------------------------------------------
 
-    st.header("7. Download Filter Files")
+    st.header("8. Download Filter Files")
 
     col1, col2, col3, col4 = st.columns(4)
 
