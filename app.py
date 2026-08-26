@@ -4,8 +4,6 @@ Streamlit front end for reverberant field analysis and EQ derivation.
 """
 
 import streamlit as st
-import sys
-import os
 import tempfile
 import shutil
 from pathlib import Path
@@ -43,12 +41,30 @@ st.sidebar.header("Room Configuration")
 
 room_name = st.sidebar.text_input(
     "Room name", value="Stage A")
-volume = st.sidebar.number_input(
-    "Room volume (m³)",
-    min_value=10.0, max_value=10000.0, value=850.0)
-surface = st.sidebar.number_input(
-    "Surface area (m²)",
-    min_value=10.0, max_value=5000.0, value=620.0)
+
+st.sidebar.subheader("Room Dimensions")
+
+room_length = st.sidebar.number_input(
+    "Length (m)",
+    min_value=1.0, max_value=200.0, value=20.0, step=0.5)
+room_width = st.sidebar.number_input(
+    "Width (m)",
+    min_value=1.0, max_value=100.0, value=15.0, step=0.5)
+room_height = st.sidebar.number_input(
+    "Height (m)",
+    min_value=1.0, max_value=30.0, value=8.0, step=0.5)
+
+volume = room_length * room_width * room_height
+surface = 2.0 * (
+    room_length * room_width +
+    room_length * room_height +
+    room_width * room_height)
+
+st.sidebar.metric("Volume (m³)", f"{volume:.1f}")
+st.sidebar.metric("Surface area (m²)", f"{surface:.1f}")
+
+st.sidebar.subheader("Measurement Settings")
+
 transition_hz = st.sidebar.selectbox(
     "Transition frequency (Hz)", [125, 250, 500], index=1)
 n_taps = st.sidebar.selectbox(
