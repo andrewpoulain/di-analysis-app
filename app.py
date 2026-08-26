@@ -1,3 +1,8 @@
+import os
+import streamlit as st
+
+st.write("Files in directory:")
+st.write(os.listdir("."))
 # app.py
 import streamlit as st
 import yaml
