@@ -1,16 +1,16 @@
-import os
-import streamlit as st
+#!/usr/bin/env python3
+"""
+Streamlit front end for reverberant field analysis and EQ derivation.
+"""
 
-st.write("Files in directory:")
-st.write(os.listdir("."))
-# app.py
 import streamlit as st
-import yaml
+import sys
+import os
 import tempfile
 import shutil
 from pathlib import Path
 import pandas as pd
-import matplotlib.pyplot as plt
+
 from di_analysis import (
     load_ir,
     apply_calibration,
@@ -41,11 +41,14 @@ st.title("Reverberant Field Analysis and EQ Target Derivation")
 
 st.sidebar.header("Room Configuration")
 
-room_name = st.sidebar.text_input("Room name", value="Stage A")
+room_name = st.sidebar.text_input(
+    "Room name", value="Stage A")
 volume = st.sidebar.number_input(
-    "Room volume (m³)", min_value=10.0, max_value=10000.0, value=850.0)
+    "Room volume (m³)",
+    min_value=10.0, max_value=10000.0, value=850.0)
 surface = st.sidebar.number_input(
-    "Surface area (m²)", min_value=10.0, max_value=5000.0, value=620.0)
+    "Surface area (m²)",
+    min_value=10.0, max_value=5000.0, value=620.0)
 transition_hz = st.sidebar.selectbox(
     "Transition frequency (Hz)", [125, 250, 500], index=1)
 n_taps = st.sidebar.selectbox(
@@ -53,25 +56,19 @@ n_taps = st.sidebar.selectbox(
 
 st.sidebar.header("Channel Configuration")
 
-channel_name = st.sidebar.text_input("Channel name", value="Left")
-gate_ms = st.sidebar.number_input(
-    "Gate length (ms, 0 = auto)", min_value=0.0,
-    max_value=100.0, value=0.0, step=0.5)
-gate_ms = None if gate_ms == 0.0 else gate_ms
+channel_name = st.sidebar.text_input(
+    "Channel name", value="Left")
+gate_ms_input = st.sidebar.number_input(
+    "Gate length ms (0 = auto)",
+    min_value=0.0, max_value=100.0, value=0.0, step=0.5)
+gate_ms = None if gate_ms_input == 0.0 else gate_ms_input
 
 hf_shelf_hz = st.sidebar.number_input(
-    "HF shelf frequency (Hz)", min_value=4000, max_value=16000,
-    value=10000, step=1000)
+    "HF shelf frequency (Hz)",
+    min_value=4000, max_value=16000, value=10000, step=1000)
 hf_shelf_db = st.sidebar.number_input(
-    "HF shelf level (dB)", min_value=-6.0, max_value=0.0,
-    value=0.0, step=0.5)
-
-max_boost = st.sidebar.number_input(
-    "Max boost (dB)", min_value=0.0, max_value=12.0,
-    value=6.0, step=0.5)
-max_cut = st.sidebar.number_input(
-    "Max cut (dB)", min_value=0.0, max_value=20.0,
-    value=12.0, step=0.5)
+    "HF shelf level (dB)",
+    min_value=-6.0, max_value=0.0, value=0.0, step=0.5)
 
 # ---------------------------------------------------------------------------
 # Main panel: file upload
@@ -81,8 +78,8 @@ st.header("1. Upload Impulse Response Files")
 
 st.info(
     "Upload WAV files exported from Smaart. "
-    "The first file is treated as the reference position (mix position). "
-    "All remaining files are spatial averaging positions.")
+    "The first file is treated as the reference position. "
+    "All remaining files are used for spatial averaging.")
 
 uploaded_files = st.file_uploader(
     "IR WAV files (upload all positions for this channel)",
@@ -90,7 +87,8 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True)
 
 cal_file = st.file_uploader(
-    "Microphone calibration file for reference position (CSV, optional)",
+    "Microphone calibration file for reference position "
+    "(two-column CSV: frequency_hz, sensitivity_db — optional)",
     type=["csv"])
 
 # ---------------------------------------------------------------------------
@@ -101,7 +99,6 @@ if uploaded_files and st.button("Run Analysis"):
 
     with st.spinner("Processing..."):
 
-        # Write uploaded files to a temp directory
         tmp_dir = Path(tempfile.mkdtemp())
         out_dir = tmp_dir / "output"
         out_dir.mkdir()
@@ -117,10 +114,10 @@ if uploaded_files and st.button("Run Analysis"):
             cal_path = tmp_dir / cal_file.name
             cal_path.write_bytes(cal_file.read())
 
-        # Load IRs
         irs = []
         ref_ir = None
         ref_fs = None
+
         for i, p in enumerate(sorted(ir_paths)):
             ir, fs = load_ir(str(p))
             if i == 0:
@@ -132,7 +129,6 @@ if uploaded_files and st.button("Run Analysis"):
 
         st.success(f"Loaded {len(irs)} IR files at {ref_fs} Hz")
 
-        # Build config dicts
         room_cfg = {
             'volume_m3': volume,
             'surface_area_m2': surface,
@@ -147,50 +143,47 @@ if uploaded_files and st.button("Run Analysis"):
             'hf_shelf_db': hf_shelf_db,
         }
 
-        # Direct field
         direct_levels, gate_ms_used = direct_field_at_bands(
             ref_ir, ref_fs, gate_ms=gate_ms)
 
-        # RT60
         rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
 
-        # Reverberant field
         reverb_levels = spatial_average_reverberant(irs, ref_fs)
 
-        # DI
-        di = estimate_di(direct_levels, reverb_levels,
-                         rt60_bands, volume, surface)
+        di = estimate_di(
+            direct_levels, reverb_levels,
+            rt60_bands, volume, surface)
 
-        # EQ target
         hf_corr, lf_corr, all_corr, predicted = derive_full_eq_target(
             direct_levels, reverb_levels, reverb_levels,
             rt60_bands, room_cfg, channel_cfg,
             transition_hz=transition_hz)
 
-        # FIR filter
         fir_coeffs, fir_freq_response = design_fir_filter(
             hf_corr, ref_fs, n_taps=n_taps,
             transition_hz=transition_hz)
 
-        # IIR filters
         sos, lf_filter_params = design_lf_iir_filters(
             lf_corr, ref_fs, transition_hz=transition_hz)
 
-        # Generate plots to files
-        plot_analysis(direct_levels, reverb_levels, di, rt60_bands,
-                      gate_ms_used, channel_name, str(out_dir))
-        plot_eq_and_filter(direct_levels, reverb_levels, all_corr,
-                           predicted, fir_freq_response, lf_filter_params,
-                           channel_name, str(out_dir))
+        plot_analysis(
+            direct_levels, reverb_levels, di, rt60_bands,
+            gate_ms_used, channel_name, str(out_dir))
 
-        # Save filter files
-        save_fir_coefficients(fir_coeffs, channel_name, ref_fs,
-                              str(out_dir))
-        save_iir_parameters(lf_filter_params, channel_name, str(out_dir))
+        plot_eq_and_filter(
+            direct_levels, reverb_levels, all_corr,
+            predicted, fir_freq_response, lf_filter_params,
+            channel_name, str(out_dir))
 
-        # Save CSV
-        df = save_csv(direct_levels, reverb_levels, di, rt60_bands,
-                      all_corr, predicted, channel_name, str(out_dir))
+        save_fir_coefficients(
+            fir_coeffs, channel_name, ref_fs, str(out_dir))
+
+        save_iir_parameters(
+            lf_filter_params, channel_name, str(out_dir))
+
+        df = save_csv(
+            direct_levels, reverb_levels, di, rt60_bands,
+            all_corr, predicted, channel_name, str(out_dir))
 
     # ---------------------------------------------------------------------------
     # Display results
@@ -217,8 +210,9 @@ if uploaded_files and st.button("Run Analysis"):
     st.dataframe(df)
 
     st.header("4. RT60 Summary")
-    rt60_display = {str(b): f"{v:.3f} s" if v else "n/a"
-                    for b, v in rt60_bands.items()}
+    rt60_display = {
+        str(b): f"{v:.3f} s" if v else "n/a"
+        for b, v in rt60_bands.items()}
     st.json(rt60_display)
 
     if lf_filter_params:
@@ -235,7 +229,6 @@ if uploaded_files and st.button("Run Analysis"):
 
     fir_txt = out_dir / f"{channel_name}_fir.txt"
     fir_wav = out_dir / f"{channel_name}_fir.wav"
-    fir_bin = out_dir / f"{channel_name}_fir.bin"
     csv_path = out_dir / f"{channel_name}_results.csv"
     iir_path = out_dir / f"{channel_name}_iir_params.csv"
 
@@ -271,5 +264,4 @@ if uploaded_files and st.button("Run Analysis"):
                 file_name=iir_path.name,
                 mime="text/csv")
 
-    # Clean up temp directory
     shutil.rmtree(tmp_dir)
