@@ -64,6 +64,8 @@ def apply_calibration(ir, fs, cal_file):
     """
     Apply a microphone calibration curve to an IR.
     cal_file: path to a two-column CSV (frequency_hz, sensitivity_db).
+    Interpolates to IR frequency resolution and applies as a
+    frequency-domain correction.
     """
     if cal_file is None or not os.path.exists(cal_file):
         return ir
@@ -78,6 +80,68 @@ def apply_calibration(ir, fs, cal_file):
     spectrum = np.fft.rfft(ir)
     spectrum_corrected = spectrum * correction
     return np.fft.irfft(spectrum_corrected, n=n)
+
+
+# ---------------------------------------------------------------------------
+# Direct arrival detection
+# ---------------------------------------------------------------------------
+
+def detect_direct_arrival(ir, fs, threshold_db=-20):
+    """
+    Find the sample index of the direct arrival.
+    Uses the first sample that exceeds threshold_db relative to peak.
+    """
+    peak = np.max(np.abs(ir))
+    if peak == 0:
+        return 0
+    power_db = 20.0 * np.log10(np.abs(ir) / peak + 1e-30)
+    candidates = np.where(power_db >= threshold_db)[0]
+    return int(candidates[0]) if len(candidates) > 0 else 0
+
+
+def detect_first_reflection(ir, fs, direct_idx, min_gap_ms=2.0):
+    """
+    Estimate the arrival time of the first significant reflection.
+    Looks for the next local peak after a minimum gap from the direct
+    arrival that exceeds -20 dB relative to the direct peak.
+    Returns sample index, or None if not found.
+    """
+    min_gap = int(min_gap_ms * fs / 1000.0)
+    search_start = direct_idx + min_gap
+    direct_level = np.abs(ir[direct_idx])
+    if direct_level == 0:
+        return None
+    threshold = direct_level * 10.0 ** (-20.0 / 20.0)
+    search = np.abs(ir[search_start:])
+    peaks, _ = sig.find_peaks(search, height=threshold,
+                               distance=min_gap)
+    if len(peaks) == 0:
+        return None
+    return int(search_start + peaks[0])
+
+
+# ---------------------------------------------------------------------------
+# Noise floor truncation
+# ---------------------------------------------------------------------------
+
+def truncate_to_noise_floor(ir, noise_floor_db=-55):
+    """
+    Truncate an IR at the point where the envelope drops to
+    noise_floor_db relative to the peak.
+    Prevents the Schroeder integral from being contaminated
+    by noise at the tail of the IR.
+    """
+    peak = np.max(np.abs(ir))
+    if peak == 0:
+        return ir
+    envelope = 20.0 * np.log10(np.abs(ir) / peak + 1e-30)
+    above = np.where(envelope >= noise_floor_db)[0]
+    if len(above) == 0:
+        return ir
+    cutoff = above[-1]
+    truncated = ir.copy()
+    truncated[cutoff:] = 0.0
+    return truncated
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +179,19 @@ def initial_decay_level(ir, fs, centre_hz):
     Return the initial Schroeder decay level for one octave band.
     Uses the mean level over the first 5 ms to reduce sensitivity
     to the direct arrival peak.
+    Aligns to direct arrival and truncates at noise floor before
+    integrating.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     ir_band = bandpass_ir(ir, fs, f_low, f_high)
+
+    # Align to direct arrival
+    direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
+    ir_band = ir_band[direct_idx:]
+
+    # Truncate at noise floor
+    ir_band = truncate_to_noise_floor(ir_band, noise_floor_db=-55)
+
     decay_db = schroeder_decay(ir_band)
     n_avg = max(1, int(0.005 * fs))
     return float(np.mean(decay_db[:n_avg]))
@@ -126,36 +200,76 @@ def initial_decay_level(ir, fs, centre_hz):
 def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
     """
     Return the Schroeder initial decay level for each octave band.
+    Result is a dict {centre_hz: level_db}.
     """
     return {int(b): initial_decay_level(ir, fs, b) for b in bands}
 
 
 # ---------------------------------------------------------------------------
-# RT60 estimation
+# RT60 estimation — T30 method consistent with Smaart
 # ---------------------------------------------------------------------------
 
-def rt60_from_schroeder(ir, fs, centre_hz, eval_range_db=(-5, -25)):
+def rt60_from_schroeder(ir, fs, centre_hz,
+                         eval_range_db=(-5, -35),
+                         noise_floor_db=-55):
     """
     Estimate RT60 in one octave band from the Schroeder decay curve.
+
+    Uses the T30 method (-5 to -35 dB eval range) consistent with
+    Smaart's default RT60 calculation. Falls back to T20 (-5 to -25 dB)
+    if the decay does not reach -35 dB above the noise floor.
+
+    Process:
+      1. Bandpass filter to octave band
+      2. Align to direct arrival
+      3. Truncate at noise floor to prevent noise contamination
+      4. Compute Schroeder backward integral
+      5. Fit line through eval range
+      6. Extrapolate slope to -60 dB
+
+    Returns RT60 in seconds, or None if the decay is unreliable.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     ir_band = bandpass_ir(ir, fs, f_low, f_high)
+
+    # Align to direct arrival
+    direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
+    ir_band = ir_band[direct_idx:]
+
+    if len(ir_band) < int(0.1 * fs):
+        return None
+
+    # Truncate at noise floor
+    ir_band = truncate_to_noise_floor(ir_band,
+                                       noise_floor_db=noise_floor_db)
+
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
-    lo, hi = eval_range_db
+
+    lo, hi = eval_range_db  # -5, -35 for T30
+
+    # Try T30 first
     mask = (decay_db <= lo) & (decay_db >= hi)
-    if mask.sum() < 10:
-        return None
+    if mask.sum() < 20:
+        # Fall back to T20
+        mask = (decay_db <= -5) & (decay_db >= -25)
+        if mask.sum() < 10:
+            return None
+
     coeffs = np.polyfit(times[mask], decay_db[mask], 1)
     slope = coeffs[0]
     if slope >= 0:
         return None
+
     return float(-60.0 / slope)
 
 
 def room_constant(rt60_s, volume_m3, surface_area_m2):
     """
     Derive the room constant R from RT60 via Sabine inversion.
+    R = S * alpha / (1 - alpha)
+    where alpha = 0.161 * V / (RT60 * S)
+    Returns R in m^2, or None if inputs are invalid.
     """
     if rt60_s is None or rt60_s <= 0:
         return None
@@ -167,6 +281,7 @@ def room_constant(rt60_s, volume_m3, surface_area_m2):
 def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
     """
     Estimate RT60 per octave band by averaging across all IR positions.
+    Uses T30 method consistent with Smaart.
     Returns dict {centre_hz: RT60_seconds}.
     """
     rt60_all = {int(b): [] for b in bands}
@@ -183,36 +298,16 @@ def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
 # Gated direct field
 # ---------------------------------------------------------------------------
 
-def detect_direct_arrival(ir, fs, threshold_db=-20):
-    """
-    Find the sample index of the direct arrival.
-    """
-    power_db = 20.0 * np.log10(
-        np.abs(ir) / (np.max(np.abs(ir)) + 1e-30))
-    candidates = np.where(power_db >= threshold_db)[0]
-    return int(candidates[0]) if len(candidates) > 0 else 0
-
-
-def detect_first_reflection(ir, fs, direct_idx, min_gap_ms=2.0):
-    """
-    Estimate the arrival time of the first significant reflection.
-    """
-    min_gap = int(min_gap_ms * fs / 1000.0)
-    search_start = direct_idx + min_gap
-    direct_level = np.abs(ir[direct_idx])
-    threshold = direct_level * 10.0 ** (-20.0 / 20.0)
-    search = np.abs(ir[search_start:])
-    peaks, _ = sig.find_peaks(search, height=threshold,
-                               distance=min_gap)
-    if len(peaks) == 0:
-        return None
-    return int(search_start + peaks[0])
-
-
 def gated_direct_field(ir, fs, gate_ms=None):
     """
     Extract the gated direct field magnitude response.
-    Returns freqs, magnitude (dB, normalised), gate_ms_used.
+
+    If gate_ms is None the gate is set automatically to 90% of the
+    interval between the direct arrival and the first reflection.
+    Falls back to 20 ms if no reflection is detected.
+
+    Returns freqs, magnitude (dB normalised to 0 dB peak),
+    and gate_ms_used.
     """
     direct_idx = detect_direct_arrival(ir, fs)
     reflection_idx = detect_first_reflection(ir, fs, direct_idx)
@@ -226,7 +321,9 @@ def gated_direct_field(ir, fs, gate_ms=None):
     else:
         gate_samples = int(gate_ms * fs / 1000.0)
 
+    gate_samples = max(gate_samples, 16)
     gate_ms_used = gate_samples / fs * 1000.0
+
     ir_gated = ir[direct_idx: direct_idx + gate_samples].copy()
     window = np.hanning(2 * len(ir_gated))[:len(ir_gated)]
     ir_gated *= window
@@ -258,13 +355,15 @@ def direct_field_at_bands(ir, fs, gate_ms=None, bands=OCTAVE_CENTRES):
 
 
 # ---------------------------------------------------------------------------
-# Spatial averaging
+# Spatial averaging of reverberant field
 # ---------------------------------------------------------------------------
 
 def spatial_average_reverberant(ir_list, fs, bands=OCTAVE_CENTRES):
     """
     Compute the spatially averaged reverberant field spectrum.
+    ir_list: list of IR arrays, one per microphone position.
     Averaging is performed in the power domain.
+    Returns dict {centre_hz: averaged_level_db}.
     """
     all_spectra = [reverberant_spectrum(ir, fs, bands) for ir in ir_list]
     averaged = {}
@@ -286,6 +385,8 @@ def estimate_di(direct_levels, reverberant_levels,
     """
     Estimate DI(f) per octave band.
     DI(f) = Direct(f) - Reverberant(f) + 10*log10(4 / R(f))
+    where R(f) is the room constant derived from RT60 and room geometry.
+    Returns dict {centre_hz: DI_dB}.
     """
     di = {}
     for b in bands:
@@ -313,6 +414,7 @@ def derive_direct_field_target(direct_levels, bands=OCTAVE_CENTRES,
     """
     Derive the direct field EQ correction per octave band.
     Target is flat (0 dB) relative to the reference band.
+    An optional HF shelf can be applied above hf_shelf_hz.
     Positive correction values mean boost, negative mean cut.
     """
     ref = direct_levels.get(ref_band, 0.0) or 0.0
@@ -337,6 +439,15 @@ def apply_correction_constraints(corrections, direct_levels,
                                   min_band_hz=250):
     """
     Apply engineering constraints to the raw correction values.
+
+    Rules:
+      1. No boost beyond max_boost_db
+      2. No cut beyond max_cut_db
+      3. No boost into a band where the reverberant field shows
+         a corresponding excess — indicates a room mode or reflection
+         rather than a speaker deficiency
+      4. No correction below min_band_hz from gated data —
+         gating is unreliable there
     """
     constrained = {}
     for b, corr in corrections.items():
@@ -372,6 +483,8 @@ def lf_correction_from_spatial_average(spatial_avg_levels,
     """
     Derive broad LF corrections from the spatially averaged
     steady-state below the transition frequency.
+    Only corrects trends broader than one octave.
+    Does not boost narrow peaks (likely modal).
     """
     bands = sorted(k for k in spatial_avg_levels
                    if k <= transition_hz)
@@ -396,6 +509,8 @@ def predict_post_eq_steady_state(direct_levels, reverberant_levels,
                                   bands=OCTAVE_CENTRES):
     """
     Predict the steady-state response after applying the EQ correction.
+    EQ affects both direct and reverberant fields since it changes
+    the radiated power.
     """
     predicted = {}
     for b in [int(b) for b in bands]:
@@ -453,6 +568,8 @@ def interpolate_correction_to_freqs(corrections, target_freqs,
     """
     Interpolate octave band corrections to a full frequency array
     using log-frequency interpolation.
+    Extrapolates flat beyond the highest and lowest defined bands.
+    NaN bands are excluded from interpolation.
     """
     bands_int = [int(b) for b in bands]
     valid = [(b, corrections[b]) for b in bands_int
@@ -471,7 +588,7 @@ def interpolate_correction_to_freqs(corrections, target_freqs,
 def minimum_phase_from_magnitude(magnitude_db, n_fft):
     """
     Derive a minimum-phase frequency response from a magnitude spectrum
-    using the cepstral method.
+    using the cepstral method (Hilbert transform of the log magnitude).
     """
     mag_full = np.concatenate([magnitude_db,
                                 magnitude_db[-2:0:-1]])
@@ -497,6 +614,15 @@ def design_fir_filter(corrections, fs, n_taps=1024,
     """
     Design a minimum-phase FIR correction filter from octave band
     corrections.
+
+    Process:
+      1. Interpolate octave band corrections to full frequency resolution
+      2. Zero corrections below transition_hz
+      3. Apply regularisation to limit maximum boost
+      4. Derive minimum-phase response via cepstral method
+      5. Convert to FIR coefficients via IFFT
+      6. Apply Kaiser window to control sidelobes
+
     Returns fir_coeffs and (freqs, magnitude_db) of the filter response.
     """
     n_fft = int(2 ** np.ceil(np.log2(n_taps))) * 4
@@ -522,6 +648,8 @@ def design_lf_iir_filters(lf_corrections, fs,
                             bands=OCTAVE_CENTRES):
     """
     Design parametric IIR biquad EQ stages for LF corrections.
+    Each octave band below transition_hz with a non-zero correction
+    gets a peak/notch biquad filter centred at that band.
     Returns sos array and list of filter parameter dicts.
     """
     sos_stages = []
@@ -576,7 +704,7 @@ def save_fir_coefficients(fir_coeffs, channel_name, fs, output_dir):
 
 def save_iir_parameters(filter_params, channel_name, output_dir):
     """
-    Save IIR biquad parameters as CSV.
+    Save IIR biquad parameters as CSV for manual DSP entry.
     """
     if not filter_params:
         return
@@ -593,7 +721,11 @@ def plot_analysis(direct_levels, reverberant_levels, di_estimates,
                   rt60_per_band, gate_ms_used, channel_name,
                   output_dir, bands=OCTAVE_CENTRES):
     """
-    Four-panel analysis plot.
+    Four-panel analysis plot:
+      Direct vs reverberant field
+      DI estimate
+      RT60 per band
+      Direct minus reverberant difference
     """
     bands_int = [int(b) for b in bands]
     labels = [str(b) for b in bands_int]
@@ -671,7 +803,11 @@ def plot_eq_and_filter(direct_levels, reverberant_levels,
                         channel_name, output_dir,
                         bands=OCTAVE_CENTRES):
     """
-    Four-panel EQ and filter plot.
+    Four-panel EQ and filter plot:
+      Before EQ
+      Derived corrections
+      FIR filter response
+      Predicted steady-state after EQ
     """
     bands_int = [int(b) for b in bands]
     labels = [str(b) for b in bands_int]
@@ -767,6 +903,9 @@ def plot_eq_and_filter(direct_levels, reverberant_levels,
 def save_csv(direct_levels, reverberant_levels, di_estimates,
              rt60_per_band, all_corrections, predicted_curve,
              channel_name, output_dir, bands=OCTAVE_CENTRES):
+    """
+    Save full per-band results as CSV.
+    """
     bands_int = [int(b) for b in bands]
     rows = []
     for b in bands_int:
@@ -829,6 +968,13 @@ def process_channel(channel_cfg, room_cfg, session_dir, output_dir):
     gate_ms = channel_cfg.get('gate_ms', None)
     direct_levels, gate_ms_used = direct_field_at_bands(
         ref_ir, ref_fs, gate_ms=gate_ms)
+
+    # Calculate transition frequency from actual gate used
+    transition_hz = max(125, int(2.0 / (gate_ms_used / 1000.0)))
+    transition_hz = int(min(
+        [b for b in OCTAVE_CENTRES if b >= transition_hz],
+        default=250))
+
     rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
     reverb_levels = spatial_average_reverberant(irs, ref_fs)
     di = estimate_di(direct_levels, reverb_levels,
@@ -843,6 +989,7 @@ def process_channel(channel_cfg, room_cfg, session_dir, output_dir):
     sos, lf_filter_params = design_lf_iir_filters(
         lf_corr, ref_fs, transition_hz=transition_hz)
 
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     plot_analysis(direct_levels, reverb_levels, di, rt60_bands,
                   gate_ms_used, channel_name, output_dir)
     plot_eq_and_filter(direct_levels, reverb_levels, all_corr,
@@ -856,6 +1003,9 @@ def process_channel(channel_cfg, room_cfg, session_dir, output_dir):
 
 
 def run_session(config_path, session_dir, output_dir):
+    """
+    Process all channels defined in the config file.
+    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     room_cfg = config['room']
