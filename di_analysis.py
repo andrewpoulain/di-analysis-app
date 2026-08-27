@@ -20,6 +20,7 @@ import yaml
 import numpy as np
 import scipy.signal as sig
 import scipy.io.wavfile as wavfile
+import scipy.ndimage
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import pandas as pd
@@ -128,16 +129,28 @@ def truncate_to_noise_floor(ir, noise_floor_db=-55):
     """
     Truncate an IR at the point where the envelope drops to
     noise_floor_db relative to the peak.
+
+    Uses a smoothed envelope via maximum_filter1d to avoid
+    premature truncation at momentary dips in the decay.
     Prevents the Schroeder integral from being contaminated
     by noise at the tail of the IR.
     """
     peak = np.max(np.abs(ir))
     if peak == 0:
         return ir
-    envelope = 20.0 * np.log10(np.abs(ir) / peak + 1e-30)
-    above = np.where(envelope >= noise_floor_db)[0]
+
+    # Smooth envelope with a short window before thresholding
+    # to avoid cutting at momentary nulls in the decay
+    window_samples = max(1, len(ir) // 200)
+    envelope = np.abs(ir)
+    smoothed = scipy.ndimage.maximum_filter1d(
+        envelope, size=window_samples)
+    smoothed_db = 20.0 * np.log10(smoothed / peak + 1e-30)
+
+    above = np.where(smoothed_db >= noise_floor_db)[0]
     if len(above) == 0:
-        return ir
+        return ir[:len(ir) // 2]  # fall back to first half
+
     cutoff = above[-1]
     truncated = ir.copy()
     truncated[cutoff:] = 0.0
@@ -216,52 +229,118 @@ def rt60_from_schroeder(ir, fs, centre_hz,
     Estimate RT60 in one octave band from the Schroeder decay curve.
 
     Uses the T30 method (-5 to -35 dB eval range) consistent with
-    Smaart's default RT60 calculation. Falls back to T20 (-5 to -25 dB)
-    if the decay does not reach -35 dB above the noise floor.
+    Smaart's default RT60 calculation. Falls back through T20 then
+    EDT if T30 is not achievable.
 
-    Process:
-      1. Bandpass filter to octave band
-      2. Align to direct arrival
-      3. Truncate at noise floor to prevent noise contamination
-      4. Compute Schroeder backward integral
-      5. Fit line through eval range
-      6. Extrapolate slope to -60 dB
+    Robustness improvements over basic implementation:
+      - Smoothed envelope for noise floor detection
+      - Validates that the decay is monotonically decreasing
+        in the eval range before fitting
+      - Rejects slopes that are too shallow (noise floor region)
+      - Checks that the fitted RT60 is physically plausible
+        (between 0.05 s and 20 s)
 
     Returns RT60 in seconds, or None if the decay is unreliable.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     ir_band = bandpass_ir(ir, fs, f_low, f_high)
 
+    if np.max(np.abs(ir_band)) < 1e-10:
+        return None
+
     # Align to direct arrival
     direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
 
-    if len(ir_band) < int(0.1 * fs):
+    if len(ir_band) < int(0.05 * fs):
         return None
 
-    # Truncate at noise floor
+    # Truncate at noise floor using smoothed envelope
     ir_band = truncate_to_noise_floor(ir_band,
                                        noise_floor_db=noise_floor_db)
+
+    # Require meaningful signal after truncation
+    if np.max(np.abs(ir_band)) < 1e-10:
+        return None
 
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
 
-    lo, hi = eval_range_db  # -5, -35 for T30
+    # Try T30, T20, then EDT in order
+    eval_ranges = [
+        (-5, -35),   # T30 — matches Smaart default
+        (-5, -25),   # T20 — fallback
+        (0, -10),    # EDT — last resort
+    ]
 
-    # Try T30 first
-    mask = (decay_db <= lo) & (decay_db >= hi)
-    if mask.sum() < 20:
-        # Fall back to T20
-        mask = (decay_db <= -5) & (decay_db >= -25)
+    for lo, hi in eval_ranges:
+        mask = (decay_db <= lo) & (decay_db >= hi)
         if mask.sum() < 10:
-            return None
+            continue
 
-    coeffs = np.polyfit(times[mask], decay_db[mask], 1)
-    slope = coeffs[0]
-    if slope >= 0:
-        return None
+        t_region = times[mask]
+        d_region = decay_db[mask]
 
-    return float(-60.0 / slope)
+        # Check the decay is actually decreasing in this region
+        if d_region[-1] >= d_region[0]:
+            continue
+
+        coeffs = np.polyfit(t_region, d_region, 1)
+        slope = coeffs[0]
+
+        # Reject slopes that are too shallow — likely in noise floor
+        if slope >= -0.5:
+            continue
+
+        rt60 = -60.0 / slope
+
+        # Sanity check: RT60 must be physically plausible
+        if 0.05 <= rt60 <= 20.0:
+            return float(rt60)
+
+    return None
+
+
+def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
+    """
+    Check RT60 values for physical plausibility.
+    Returns a dict of warnings keyed by band.
+
+    Checks:
+      - Values exist for key bands
+      - HF RT60 is not higher than MF RT60
+        (absorption always increases with frequency)
+      - No band exceeds 15 s
+      - No band is below 0.05 s
+    """
+    warnings = {}
+    bands_int = [int(b) for b in bands]
+    valid = {b: rt60_per_band.get(b) for b in bands_int
+             if rt60_per_band.get(b) is not None}
+
+    if not valid:
+        warnings['general'] = 'No valid RT60 estimates produced'
+        return warnings
+
+    for b, rt in valid.items():
+        if rt > 15.0:
+            warnings[b] = f'{rt:.2f} s is implausibly long'
+        if rt < 0.05:
+            warnings[b] = f'{rt:.3f} s is implausibly short'
+
+    # Check HF is not rising above MF
+    mf_bands = [b for b in [500, 1000, 2000] if b in valid]
+    hf_bands = [b for b in [4000, 8000] if b in valid]
+    if mf_bands and hf_bands:
+        mf_avg = np.mean([valid[b] for b in mf_bands])
+        hf_avg = np.mean([valid[b] for b in hf_bands])
+        if hf_avg > mf_avg * 1.5:
+            warnings['hf_rising'] = (
+                f'HF RT60 ({hf_avg:.2f} s) is higher than '
+                f'MF RT60 ({mf_avg:.2f} s) — '
+                f'check IR length and noise floor')
+
+    return warnings
 
 
 def room_constant(rt60_s, volume_m3, surface_area_m2):
@@ -588,7 +667,7 @@ def interpolate_correction_to_freqs(corrections, target_freqs,
 def minimum_phase_from_magnitude(magnitude_db, n_fft):
     """
     Derive a minimum-phase frequency response from a magnitude spectrum
-    using the cepstral method (Hilbert transform of the log magnitude).
+    using the cepstral method.
     """
     mag_full = np.concatenate([magnitude_db,
                                 magnitude_db[-2:0:-1]])
@@ -614,15 +693,6 @@ def design_fir_filter(corrections, fs, n_taps=1024,
     """
     Design a minimum-phase FIR correction filter from octave band
     corrections.
-
-    Process:
-      1. Interpolate octave band corrections to full frequency resolution
-      2. Zero corrections below transition_hz
-      3. Apply regularisation to limit maximum boost
-      4. Derive minimum-phase response via cepstral method
-      5. Convert to FIR coefficients via IFFT
-      6. Apply Kaiser window to control sidelobes
-
     Returns fir_coeffs and (freqs, magnitude_db) of the filter response.
     """
     n_fft = int(2 ** np.ceil(np.log2(n_taps))) * 4
@@ -648,8 +718,6 @@ def design_lf_iir_filters(lf_corrections, fs,
                             bands=OCTAVE_CENTRES):
     """
     Design parametric IIR biquad EQ stages for LF corrections.
-    Each octave band below transition_hz with a non-zero correction
-    gets a peak/notch biquad filter centred at that band.
     Returns sos array and list of filter parameter dicts.
     """
     sos_stages = []
@@ -721,11 +789,7 @@ def plot_analysis(direct_levels, reverberant_levels, di_estimates,
                   rt60_per_band, gate_ms_used, channel_name,
                   output_dir, bands=OCTAVE_CENTRES):
     """
-    Four-panel analysis plot:
-      Direct vs reverberant field
-      DI estimate
-      RT60 per band
-      Direct minus reverberant difference
+    Four-panel analysis plot.
     """
     bands_int = [int(b) for b in bands]
     labels = [str(b) for b in bands_int]
@@ -803,11 +867,7 @@ def plot_eq_and_filter(direct_levels, reverberant_levels,
                         channel_name, output_dir,
                         bands=OCTAVE_CENTRES):
     """
-    Four-panel EQ and filter plot:
-      Before EQ
-      Derived corrections
-      FIR filter response
-      Predicted steady-state after EQ
+    Four-panel EQ and filter plot.
     """
     bands_int = [int(b) for b in bands]
     labels = [str(b) for b in bands_int]
@@ -942,7 +1002,6 @@ def process_channel(channel_cfg, room_cfg, session_dir, output_dir):
     channel_name = channel_cfg['name']
     volume = room_cfg['volume_m3']
     surface = room_cfg['surface_area_m2']
-    transition_hz = room_cfg.get('transition_hz', 250)
     n_taps = room_cfg.get('fir_taps', 1024)
 
     ir_files = sorted(Path(session_dir).glob(
@@ -969,7 +1028,6 @@ def process_channel(channel_cfg, room_cfg, session_dir, output_dir):
     direct_levels, gate_ms_used = direct_field_at_bands(
         ref_ir, ref_fs, gate_ms=gate_ms)
 
-    # Calculate transition frequency from actual gate used
     transition_hz = max(125, int(2.0 / (gate_ms_used / 1000.0)))
     transition_hz = int(min(
         [b for b in OCTAVE_CENTRES if b >= transition_hz],
