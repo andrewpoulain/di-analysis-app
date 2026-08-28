@@ -56,6 +56,33 @@ def third_octave_band_limits(centre_hz):
 
 
 # ---------------------------------------------------------------------------
+# Truncation margin scaled by frequency
+# ---------------------------------------------------------------------------
+
+def truncation_margin_for_band(centre_hz):
+    """
+    Return the noise floor truncation margin in dB for a given
+    centre frequency.
+
+    The margin is scaled with frequency because at high frequencies
+    the IR decays quickly and the signal drops into the noise floor
+    faster than at mid frequencies. A larger margin preserves more
+    of the decay tail and prevents premature truncation that would
+    cause the T20 slope fit to fail or underestimate RT60.
+
+      Below 500 Hz:    10 dB  (long decays, tighter truncation ok)
+      500 Hz to 4 kHz: 12 dB
+      Above 4 kHz:     15 dB  (short decays need wider margin)
+    """
+    if centre_hz >= 4000:
+        return 15.0
+    elif centre_hz >= 500:
+        return 12.0
+    else:
+        return 10.0
+
+
+# ---------------------------------------------------------------------------
 # IR loading
 # ---------------------------------------------------------------------------
 
@@ -137,12 +164,21 @@ def detect_first_reflection(ir, fs, direct_idx, min_gap_ms=2.0):
 # Noise floor truncation
 # ---------------------------------------------------------------------------
 
-def truncate_to_noise_floor(ir):
+def truncate_to_noise_floor(ir, margin_db=10.0):
     """
     Truncate an IR at the point where the envelope drops to
-    6 dB above the dynamic noise floor.
-    The noise floor is estimated from the last 10% of the
-    smoothed envelope.
+    margin_db above the dynamic noise floor.
+
+    The noise floor is estimated from the last 10% of the smoothed
+    envelope. margin_db controls how far above the noise floor the
+    truncation point is set.
+
+    A larger margin_db preserves more of the decay tail and is
+    needed at high frequencies where the decay is short and the
+    signal drops quickly into the noise floor.
+
+    Use truncation_margin_for_band() to get the appropriate margin
+    for each frequency band rather than using the default directly.
     """
     peak = np.max(np.abs(ir))
     if peak == 0:
@@ -154,9 +190,12 @@ def truncate_to_noise_floor(ir):
         envelope, size=window_samples)
     smoothed_db = 20.0 * np.log10(smoothed / peak + 1e-30)
 
+    # Dynamic noise floor from last 10% of smoothed envelope
     tail_start = int(len(smoothed_db) * 0.9)
     noise_floor_db = float(np.mean(smoothed_db[tail_start:]))
-    truncation_threshold_db = noise_floor_db + 6.0
+
+    # Truncation threshold above dynamic noise floor
+    truncation_threshold_db = noise_floor_db + margin_db
 
     above = np.where(smoothed_db >= truncation_threshold_db)[0]
     if len(above) == 0:
@@ -174,7 +213,8 @@ def truncate_to_noise_floor(ir):
 
 def bandpass_ir(ir, fs, f_low, f_high):
     """
-    Bandpass filter an IR using a 4th-order zero-phase Butterworth filter.
+    Bandpass filter an IR using a 4th-order zero-phase Butterworth
+    filter. sosfiltfilt eliminates phase distortion.
     """
     nyq = fs / 2.0
     f_low = max(f_low, 10.0)
@@ -188,13 +228,21 @@ def bandpass_ir(ir, fs, f_low, f_high):
 
 def schroeder_decay(ir_band):
     """
-    Compute the Schroeder backward integral with noise energy subtraction.
-    Returns the decay curve normalised so the initial value is 0 dB.
+    Compute the Schroeder backward integral with noise energy
+    subtraction.
+
+    Estimates noise power from the last 10% of the squared IR and
+    subtracts it before integration. Negative values are clamped to
+    zero. Returns the decay curve normalised so the initial value
+    is 0 dB.
     """
     power = ir_band ** 2
+
+    # Estimate and subtract noise power from last 10%
     tail_start = int(len(power) * 0.9)
     noise_power = float(np.mean(power[tail_start:]))
     power_compensated = np.maximum(power - noise_power, 0.0)
+
     decay = np.cumsum(power_compensated[::-1])[::-1]
     decay = np.maximum(decay, 1e-30)
     decay_db = 10.0 * np.log10(decay / decay[0])
@@ -204,12 +252,14 @@ def schroeder_decay(ir_band):
 def initial_decay_level(ir, fs, centre_hz):
     """
     Return the initial Schroeder decay level for one octave band.
+    Uses frequency-scaled truncation margin.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     ir_band = bandpass_ir(ir, fs, f_low, f_high)
     direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
-    ir_band = truncate_to_noise_floor(ir_band)
+    margin_db = truncation_margin_for_band(centre_hz)
+    ir_band = truncate_to_noise_floor(ir_band, margin_db=margin_db)
     decay_db = schroeder_decay(ir_band)
     n_avg = max(1, int(0.005 * fs))
     return float(np.mean(decay_db[:n_avg]))
@@ -230,8 +280,18 @@ def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
 def rt60_from_schroeder(ir, fs, centre_hz):
     """
     Estimate RT60 in one octave band from the Schroeder decay curve.
-    Uses T20 as primary, T30 as fallback, EDT as last resort.
-    Returns RT60 in seconds, or None if unreliable.
+
+    Uses T20 as primary method, T30 as first fallback, EDT as last
+    resort. T20 is prioritised because TF-derived IRs from Smaart
+    using broadband noise excitation typically have lower SNR than
+    swept sine measurements.
+
+    The truncation margin is scaled with frequency via
+    truncation_margin_for_band() to prevent premature truncation
+    of short high-frequency decays which caused the 16 kHz band
+    to be significantly underestimated.
+
+    Returns RT60 in seconds, or None if the decay is unreliable.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     ir_band = bandpass_ir(ir, fs, f_low, f_high)
@@ -245,7 +305,9 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     if len(ir_band) < int(0.05 * fs):
         return None
 
-    ir_band = truncate_to_noise_floor(ir_band)
+    # Frequency-scaled truncation margin
+    margin_db = truncation_margin_for_band(centre_hz)
+    ir_band = truncate_to_noise_floor(ir_band, margin_db=margin_db)
 
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
@@ -255,7 +317,7 @@ def rt60_from_schroeder(ir, fs, centre_hz):
 
     eval_ranges = [
         (-5, -25),   # T20 — primary
-        (-5, -35),   # T30 — fallback
+        (-5, -35),   # T30 — first fallback
         (0,  -10),   # EDT — last resort
     ]
 
@@ -440,6 +502,7 @@ def reverberant_spectrum_third_octave(ir, fs,
                                        bands=THIRD_OCTAVE_CENTRES):
     """
     Return the Schroeder initial decay level for each 1/3-octave band.
+    Uses frequency-scaled truncation margin.
     """
     result = {}
     for b in bands:
@@ -448,7 +511,9 @@ def reverberant_spectrum_third_octave(ir, fs,
         direct_idx = detect_direct_arrival(
             ir_band, fs, threshold_db=-20)
         ir_band = ir_band[direct_idx:]
-        ir_band = truncate_to_noise_floor(ir_band)
+        margin_db = truncation_margin_for_band(b)
+        ir_band = truncate_to_noise_floor(
+            ir_band, margin_db=margin_db)
         decay_db = schroeder_decay(ir_band)
         n_avg = max(1, int(0.005 * fs))
         result[float(b)] = float(np.mean(decay_db[:n_avg]))
@@ -711,39 +776,22 @@ def export_target_for_smaart(target_levels_3rd,
     imported into Smaart as a reference curve.
 
     Smaart reference curve format:
-      - Two columns: frequency (Hz) and level (dB SPL or relative dB)
-      - No header row
-      - Comma separated
-      - Frequencies in ascending order
+      Comment line starting with *
+      Two columns: frequency (Hz) and level (dB)
+      Comma separated, no header row
+      Frequencies in ascending order
 
     The target is exported as absolute dB values referenced to the
-    measured direct field level at 1 kHz. This means when imported
-    into Smaart and overlaid on a transfer function measurement at
-    the same gain setting, the target will align correctly.
-
-    Parameters
-    ----------
-    target_levels_3rd : dict {freq_hz: level_db}
-        Target levels in 1/3-octave bands normalised to 0 dB at 1 kHz.
-    direct_levels_3rd : dict {freq_hz: level_db}
-        Measured direct field levels in 1/3-octave bands.
-    ref_level_db : float
-        Absolute reference level in dB at 1 kHz to anchor the export.
-        Use the measured direct field level at 1 kHz.
-    output_path : str or Path
-        Full path for the output CSV file.
-    label : str
-        Label written as a comment in the first line.
+    measured direct field level at 1 kHz so that when imported into
+    Smaart and overlaid on a transfer function measurement at the
+    same gain setting the target will align correctly.
     """
     bands_sorted = sorted(target_levels_3rd.keys())
-
     rows = []
     for b in bands_sorted:
         level_norm = target_levels_3rd.get(b, np.nan)
         if np.isnan(level_norm):
             continue
-        # Convert from normalised (0 dB at 1 kHz) to absolute
-        # by adding the measured reference level at 1 kHz
         level_abs = level_norm + ref_level_db
         rows.append((float(b), round(level_abs, 3)))
 
@@ -761,23 +809,13 @@ def export_xcurve_for_smaart(xcurve_levels_3rd,
                               output_path,
                               screen_size='large'):
     """
-    Export the X-curve target as a Smaart-compatible reference curve CSV.
-
-    Parameters
-    ----------
-    xcurve_levels_3rd : dict {freq_hz: level_db}
-        X-curve levels at 1/3-octave bands (0 dB = flat region).
-    ref_level_db : float
-        Absolute reference level in dB at 1 kHz to anchor the export.
-    output_path : str or Path
-        Full path for the output CSV file.
-    screen_size : str
-        'large' or 'small' — used in the label only.
+    Export the X-curve target as a Smaart-compatible reference
+    curve CSV.
     """
     label = (
         f'X-curve target '
-        f'({"large room" if screen_size == "large" else "small room"}, '
-        f'SMPTE ST 202M / ISO 2969)')
+        f'({"large room" if screen_size == "large" else "small room"}'
+        f', SMPTE ST 202M / ISO 2969)')
 
     bands_sorted = sorted(xcurve_levels_3rd.keys())
     rows = []
