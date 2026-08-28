@@ -125,15 +125,18 @@ def detect_first_reflection(ir, fs, direct_idx, min_gap_ms=2.0):
 # Noise floor truncation
 # ---------------------------------------------------------------------------
 
-def truncate_to_noise_floor(ir, noise_floor_db=-55):
+def truncate_to_noise_floor(ir):
     """
     Truncate an IR at the point where the envelope drops to
-    noise_floor_db relative to the peak.
+    6 dB above the dynamic noise floor.
+
+    The noise floor is estimated from the average dB level of the
+    last 10% of the smoothed envelope rather than using a hardcoded
+    absolute threshold. This makes the truncation adaptive to the
+    actual noise floor of each measurement.
 
     Uses a smoothed envelope via maximum_filter1d to avoid
     premature truncation at momentary dips in the decay.
-    Prevents the Schroeder integral from being contaminated
-    by noise at the tail of the IR.
     """
     peak = np.max(np.abs(ir))
     if peak == 0:
@@ -147,7 +150,14 @@ def truncate_to_noise_floor(ir, noise_floor_db=-55):
         envelope, size=window_samples)
     smoothed_db = 20.0 * np.log10(smoothed / peak + 1e-30)
 
-    above = np.where(smoothed_db >= noise_floor_db)[0]
+    # Calculate dynamic noise floor from last 10% of smoothed envelope
+    tail_start = int(len(smoothed_db) * 0.9)
+    noise_floor_db = float(np.mean(smoothed_db[tail_start:]))
+
+    # Set truncation threshold 6 dB above the dynamic noise floor
+    truncation_threshold_db = noise_floor_db + 6.0
+
+    above = np.where(smoothed_db >= truncation_threshold_db)[0]
     if len(above) == 0:
         return ir[:len(ir) // 2]  # fall back to first half
 
@@ -164,6 +174,12 @@ def truncate_to_noise_floor(ir, noise_floor_db=-55):
 def bandpass_ir(ir, fs, f_low, f_high):
     """
     Bandpass filter an IR using a 4th-order Butterworth filter.
+
+    Uses sosfiltfilt (zero-phase filtering) instead of sosfilt to
+    eliminate phase distortion in the filtered IR. This gives a
+    symmetric impulse response centred on the true arrival time,
+    which improves the accuracy of the direct arrival detection
+    and the Schroeder decay shape.
     """
     nyq = fs / 2.0
     f_low = max(f_low, 10.0)
@@ -172,16 +188,35 @@ def bandpass_ir(ir, fs, f_low, f_high):
         return np.zeros_like(ir)
     sos = sig.butter(4, [f_low / nyq, f_high / nyq],
                      btype='band', output='sos')
-    return sig.sosfilt(sos, ir)
+    # Zero-phase filtering: eliminates phase distortion
+    return sig.sosfiltfilt(sos, ir)
 
 
 def schroeder_decay(ir_band):
     """
-    Compute the Schroeder backward integral of a bandpass-filtered IR.
+    Compute the Schroeder backward integral of a bandpass-filtered IR
+    with noise energy subtraction.
+
+    The average noise power is estimated from the last 10% of the
+    squared IR and subtracted from the full power array before
+    integration. Negative values after subtraction are set to zero.
+    This compensates for the noise floor bias in the backward integral
+    and produces a cleaner decay curve, particularly at low SNR.
+
     Returns the decay curve normalised so that the initial value is 0 dB.
     """
     power = ir_band ** 2
-    decay = np.cumsum(power[::-1])[::-1]
+
+    # Estimate noise power from last 10% of the signal
+    tail_start = int(len(power) * 0.9)
+    noise_power = float(np.mean(power[tail_start:]))
+
+    # Subtract noise power and clamp negatives to zero
+    power_compensated = power - noise_power
+    power_compensated = np.maximum(power_compensated, 0.0)
+
+    # Backward cumulative sum on noise-compensated power
+    decay = np.cumsum(power_compensated[::-1])[::-1]
     decay = np.maximum(decay, 1e-30)
     decay_db = 10.0 * np.log10(decay / decay[0])
     return decay_db
@@ -202,8 +237,8 @@ def initial_decay_level(ir, fs, centre_hz):
     direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
 
-    # Truncate at noise floor
-    ir_band = truncate_to_noise_floor(ir_band, noise_floor_db=-55)
+    # Truncate at dynamic noise floor
+    ir_band = truncate_to_noise_floor(ir_band)
 
     decay_db = schroeder_decay(ir_band)
     n_avg = max(1, int(0.005 * fs))
@@ -219,26 +254,32 @@ def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
 
 
 # ---------------------------------------------------------------------------
-# RT60 estimation — T30 method consistent with Smaart
+# RT60 estimation — T20 primary, T30 fallback, EDT last resort
 # ---------------------------------------------------------------------------
 
 def rt60_from_schroeder(ir, fs, centre_hz,
-                         eval_range_db=(-5, -35),
-                         noise_floor_db=-55):
+                         eval_range_db=(-5, -25)):
     """
     Estimate RT60 in one octave band from the Schroeder decay curve.
 
-    Uses the T30 method (-5 to -35 dB eval range) consistent with
-    Smaart's default RT60 calculation. Falls back through T20 then
-    EDT if T30 is not achievable.
+    Evaluation order:
+      1. T20 (-5 to -25 dB) — primary, most robust for noisy IRs
+      2. T30 (-5 to -35 dB) — first fallback
+      3. EDT (0 to -10 dB)  — last resort
 
-    Robustness improvements over basic implementation:
-      - Smoothed envelope for noise floor detection
-      - Validates that the decay is monotonically decreasing
-        in the eval range before fitting
-      - Rejects slopes that are too shallow (noise floor region)
-      - Checks that the fitted RT60 is physically plausible
-        (between 0.05 s and 20 s)
+    T20 is prioritised because TF-derived IRs from Smaart using
+    broadband noise excitation typically have lower SNR than swept
+    sine measurements. T20 uses the strongest part of the decay
+    where SNR is highest and is therefore more reliable in this
+    measurement context.
+
+    Additional robustness measures:
+      - Zero-phase bandpass filtering via sosfiltfilt
+      - Noise energy subtraction in Schroeder integration
+      - Dynamic noise floor truncation
+      - Monotonicity check on decay in eval range
+      - Minimum slope threshold to reject noise floor fits
+      - Physical plausibility check on result
 
     Returns RT60 in seconds, or None if the decay is unreliable.
     """
@@ -255,22 +296,22 @@ def rt60_from_schroeder(ir, fs, centre_hz,
     if len(ir_band) < int(0.05 * fs):
         return None
 
-    # Truncate at noise floor using smoothed envelope
-    ir_band = truncate_to_noise_floor(ir_band,
-                                       noise_floor_db=noise_floor_db)
+    # Truncate at dynamic noise floor
+    ir_band = truncate_to_noise_floor(ir_band)
 
-    # Require meaningful signal after truncation
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
 
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
 
-    # Try T30, T20, then EDT in order
+    # T20 first — most robust for noise-excited TF-derived IRs
+    # T30 fallback — requires higher SNR
+    # EDT last resort — shortest eval range, least reliable for RT60
     eval_ranges = [
-        (-5, -35),   # T30 — matches Smaart default
-        (-5, -25),   # T20 — fallback
-        (0, -10),    # EDT — last resort
+        (-5, -25),   # T20 — primary
+        (-5, -35),   # T30 — first fallback
+        (0,  -10),   # EDT — last resort
     ]
 
     for lo, hi in eval_ranges:
@@ -360,7 +401,8 @@ def room_constant(rt60_s, volume_m3, surface_area_m2):
 def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
     """
     Estimate RT60 per octave band by averaging across all IR positions.
-    Uses T30 method consistent with Smaart.
+    Uses T20 as primary method, consistent with noisy TF-derived IRs
+    from Smaart.
     Returns dict {centre_hz: RT60_seconds}.
     """
     rt60_all = {int(b): [] for b in bands}
