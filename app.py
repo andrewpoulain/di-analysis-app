@@ -415,7 +415,7 @@ if uploaded_files and st.button("Run Analysis"):
         height=560,
         hovermode='x unified')
 
-    st.plotly_chart(fig_main, use_container_width=True)
+    st.plotly_chart(fig_main, width='stretch')
 
     if show_xcurve:
         st.caption(
@@ -487,7 +487,7 @@ if uploaded_files and st.button("Run Analysis"):
         title_text='Filter magnitude (dB)', row=1, col=2)
     fig_eq.update_layout(height=400)
 
-    st.plotly_chart(fig_eq, use_container_width=True)
+    st.plotly_chart(fig_eq, width='stretch')
 
     # ---------------------------------------------------------------
     # RT60 and DI plots
@@ -535,4 +535,81 @@ if uploaded_files and st.button("Run Analysis"):
         title_text='DI (dB)', row=1, col=2)
     fig_rt_di.update_layout(height=400)
 
-    st.plot
+    st.plotly_chart(fig_rt_di, width='stretch')
+
+    # ---------------------------------------------------------------
+    # Summary metrics
+    # ---------------------------------------------------------------
+
+    st.header("5. Measurement Summary")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Gate length", f"{gate_ms_used:.1f} ms")
+    with col2:
+        st.metric("Transition frequency", f"{transition_hz} Hz")
+    with col3:
+        st.metric("IR files processed", len(irs))
+    with col4:
+        valid_rt60 = [v for v in rt60_bands.values()
+                      if v is not None]
+        avg_rt60 = np.mean(valid_rt60) if valid_rt60 else 0.0
+        st.metric("Mean RT60", f"{avg_rt60:.2f} s")
+
+    # ---------------------------------------------------------------
+    # Results table
+    # ---------------------------------------------------------------
+
+    st.header("6. Results Table")
+    st.dataframe(df)
+
+    if lf_filter_params:
+        st.header("7. LF IIR Filter Parameters")
+        st.dataframe(pd.DataFrame(lf_filter_params))
+
+    # ---------------------------------------------------------------
+    # Downloads
+    # ---------------------------------------------------------------
+
+    st.header("8. Download Filter Files")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    fir_txt = out_dir / f"{channel_name}_fir.txt"
+    fir_wav = out_dir / f"{channel_name}_fir.wav"
+    csv_path = out_dir / f"{channel_name}_results.csv"
+    iir_path = out_dir / f"{channel_name}_iir_params.csv"
+
+    if fir_txt.exists():
+        with col1:
+            st.download_button(
+                "FIR coefficients (text)",
+                data=fir_txt.read_bytes(),
+                file_name=fir_txt.name,
+                mime="text/plain")
+
+    if fir_wav.exists():
+        with col2:
+            st.download_button(
+                "FIR as WAV (for FIR Designer)",
+                data=fir_wav.read_bytes(),
+                file_name=fir_wav.name,
+                mime="audio/wav")
+
+    if csv_path.exists():
+        with col3:
+            st.download_button(
+                "Results CSV",
+                data=csv_path.read_bytes(),
+                file_name=csv_path.name,
+                mime="text/csv")
+
+    if iir_path.exists():
+        with col4:
+            st.download_button(
+                "IIR parameters CSV",
+                data=iir_path.read_bytes(),
+                file_name=iir_path.name,
+                mime="text/csv")
+
+    shutil.rmtree(tmp_dir)
