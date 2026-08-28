@@ -161,7 +161,7 @@ if uploaded_files and st.button("Run Analysis"):
             cal_path = tmp_dir / cal_file.name
             cal_path.write_bytes(cal_file.read())
 
-        # Load IRs
+        # Load IRs in alphabetical order
         irs = []
         ref_ir = None
         ref_fs = None
@@ -212,6 +212,8 @@ if uploaded_files and st.button("Run Analysis"):
             direct_levels, reverb_levels,
             rt60_bands, volume, surface)
 
+        # derive_full_eq_target returns three values in the
+        # simplified version: hf_corr, lf_corr, all_corr
         hf_corr, lf_corr, all_corr = derive_full_eq_target(
             direct_levels, reverb_levels, reverb_levels,
             channel_cfg,
@@ -227,47 +229,57 @@ if uploaded_files and st.button("Run Analysis"):
         reverb_levels_3rd = \
             spatial_average_reverberant_third_octave(irs, ref_fs)
 
-        # Predicted steady-state BEFORE EQ (zero corrections)
+        # Zero corrections dict with float keys matching
+        # the octave band centres used in all_corr
         zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
+
+        # Predicted steady-state BEFORE EQ
         predicted_before_3rd = \
             predict_post_eq_steady_state_third_octave(
-                direct_levels_3rd, reverb_levels_3rd, zero_corr)
+                direct_levels_3rd,
+                reverb_levels_3rd,
+                zero_corr)
 
         # Predicted steady-state AFTER EQ
+        # all_corr keys are int, which is correct for
+        # predict_post_eq_steady_state_third_octave
         predicted_after_3rd = \
             predict_post_eq_steady_state_third_octave(
-                direct_levels_3rd, reverb_levels_3rd, all_corr)
+                direct_levels_3rd,
+                reverb_levels_3rd,
+                all_corr)
 
         # -----------------------------------------------------------
-        # X-curve
+        # Reference level for normalisation
+        # Use 1000.0 as float key to match direct_levels_3rd
         # -----------------------------------------------------------
 
-        xcurve_raw = xcurve_at_third_octave_bands(
-            bands=THIRD_OCTAVE_CENTRES,
-            screen_size=xcurve_size)
-
-        # Align X-curve to measured direct field at reference band
-        third_oct_sorted = sorted(direct_levels_3rd.keys())
-        direct_vals_sorted = [
-            direct_levels_3rd[b] for b in third_oct_sorted]
-        ref_direct_level = float(np.interp(
-            np.log10(float(xcurve_ref_band)),
-            np.log10(third_oct_sorted),
-            direct_vals_sorted))
+        ref_level_3rd = direct_levels_3rd.get(1000.0, None)
+        if ref_level_3rd is None or np.isnan(ref_level_3rd):
+            # Fall back to nearest available band
+            available = {
+                k: v for k, v in direct_levels_3rd.items()
+                if not np.isnan(v)}
+            if available:
+                ref_level_3rd = available[
+                    min(available.keys(),
+                        key=lambda k: abs(k - 1000.0))]
+            else:
+                ref_level_3rd = 0.0
 
         # -----------------------------------------------------------
         # Normalise all display traces to 0 dB at 1 kHz
         # -----------------------------------------------------------
 
-        ref_level_3rd = direct_levels_3rd.get(1000.0, 0.0) or 0.0
-
         direct_3rd_norm = {
             b: v - ref_level_3rd
-            for b, v in direct_levels_3rd.items()}
+            for b, v in direct_levels_3rd.items()
+            if not np.isnan(v)}
 
         reverb_3rd_norm = {
             b: v - ref_level_3rd
-            for b, v in reverb_levels_3rd.items()}
+            for b, v in reverb_levels_3rd.items()
+            if not np.isnan(v)}
 
         before_3rd_norm = {
             b: v - ref_level_3rd
@@ -279,11 +291,36 @@ if uploaded_files and st.button("Run Analysis"):
             for b, v in predicted_after_3rd.items()
             if not np.isnan(v)}
 
-        # X-curve display: normalised so 0 dB aligns to
-        # the flat region of the curve
-        xcurve_display = {
-            b: v
-            for b, v in xcurve_raw.items()}
+        # -----------------------------------------------------------
+        # X-curve aligned to measured direct field
+        # -----------------------------------------------------------
+
+        xcurve_raw = xcurve_at_third_octave_bands(
+            bands=THIRD_OCTAVE_CENTRES,
+            screen_size=xcurve_size)
+
+        third_oct_sorted = sorted(direct_levels_3rd.keys())
+        direct_vals_sorted = [
+            direct_levels_3rd[b] for b in third_oct_sorted]
+        ref_direct_level = float(np.interp(
+            np.log10(float(xcurve_ref_band)),
+            np.log10(third_oct_sorted),
+            direct_vals_sorted))
+
+        # X-curve displayed normalised to 0 dB at its flat region
+        xcurve_display = dict(xcurve_raw)
+
+        # -----------------------------------------------------------
+        # Debug: show trace sizes so we can confirm data is present
+        # -----------------------------------------------------------
+
+        st.caption(
+            f"Trace sizes — "
+            f"direct: {len(direct_3rd_norm)}, "
+            f"reverb: {len(reverb_3rd_norm)}, "
+            f"before EQ: {len(before_3rd_norm)}, "
+            f"after EQ: {len(after_3rd_norm)}, "
+            f"ref level at 1 kHz: {ref_level_3rd:.2f} dB")
 
         # -----------------------------------------------------------
         # Save CSV results
@@ -297,8 +334,8 @@ if uploaded_files and st.button("Run Analysis"):
         # Save Smaart export files
         # -----------------------------------------------------------
 
-        # EQ target export
-        eq_target_path = out_dir / f"{channel_name}_eq_target.txt"
+        eq_target_path = (
+            out_dir / f"{channel_name}_eq_target.txt")
         export_target_for_smaart(
             target_levels_3rd=after_3rd_norm,
             direct_levels_3rd=direct_levels_3rd,
@@ -306,11 +343,11 @@ if uploaded_files and st.button("Run Analysis"):
             output_path=eq_target_path,
             label=f'{channel_name} EQ Target — {room_name}')
 
-        # X-curve export
         xcurve_export_path = (
             out_dir /
             f"{channel_name}_xcurve_"
-            f"{'large' if xcurve_size == 'large' else 'small'}.txt")
+            f"{'large' if xcurve_size == 'large' else 'small'}"
+            f".txt")
         export_xcurve_for_smaart(
             xcurve_levels_3rd=xcurve_raw,
             ref_level_db=ref_direct_level,
@@ -332,9 +369,14 @@ if uploaded_files and st.button("Run Analysis"):
 
     def make_trace(levels_dict, name, colour,
                    dash='solid', width=2, opacity=1.0):
+        """Build a Plotly scatter trace from a frequency:level dict."""
+        if not levels_dict:
+            return go.Scatter(
+                x=[], y=[], name=name,
+                line=dict(color=colour))
         bands_sorted = sorted(levels_dict.keys())
         x = [float(b) for b in bands_sorted]
-        y = [levels_dict[b] for b in bands_sorted]
+        y = [float(levels_dict[b]) for b in bands_sorted]
         return go.Scatter(
             x=x, y=y,
             mode='lines+markers',
@@ -354,30 +396,42 @@ if uploaded_files and st.button("Run Analysis"):
     fig_main.add_trace(make_trace(
         direct_3rd_norm,
         'Direct field (1/3 oct)',
-        'steelblue', width=2))
+        'steelblue',
+        width=2))
 
     fig_main.add_trace(make_trace(
         reverb_3rd_norm,
         'Reverberant field (spatially averaged)',
-        'firebrick', dash='dash', width=1.5, opacity=0.7))
+        'firebrick',
+        dash='dash',
+        width=1.5,
+        opacity=0.7))
 
     fig_main.add_trace(make_trace(
         before_3rd_norm,
         'Predicted steady-state before EQ',
-        'grey', dash='dot', width=1.5, opacity=0.8))
+        'grey',
+        dash='dot',
+        width=1.5,
+        opacity=0.8))
 
     fig_main.add_trace(make_trace(
         after_3rd_norm,
         'Predicted steady-state after EQ',
-        'darkorange', width=2))
+        'darkorange',
+        width=2))
 
     flat_target = {
-        float(b): 0.0 for b in THIRD_OCTAVE_CENTRES
+        float(b): 0.0
+        for b in THIRD_OCTAVE_CENTRES
         if float(b) >= 63}
     fig_main.add_trace(make_trace(
         flat_target,
         'Flat target',
-        'green', dash='dot', width=1.5, opacity=0.6))
+        'green',
+        dash='dot',
+        width=1.5,
+        opacity=0.6))
 
     if show_xcurve:
         xcurve_label = (
@@ -387,7 +441,9 @@ if uploaded_files and st.button("Run Analysis"):
         fig_main.add_trace(make_trace(
             xcurve_display,
             xcurve_label,
-            'purple', dash='dashdot', width=2))
+            'purple',
+            dash='dashdot',
+            width=2))
 
     fig_main.update_layout(
         title=(
@@ -565,7 +621,7 @@ if uploaded_files and st.button("Run Analysis"):
         with col2:
             st.download_button(
                 label=(
-                    f"X-curve target "
+                    f"X-curve "
                     f"({'large' if xcurve_size == 'large' else 'small'}"
                     f" room, Smaart)"),
                 data=xcurve_export_path.read_bytes(),
