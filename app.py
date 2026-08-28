@@ -280,7 +280,7 @@ if uploaded_files and st.button("Run Analysis"):
             f"8 kHz: {air_abs_8k:.2f} dB, "
             f"16 kHz: {air_abs_16k:.2f} dB")
 
-        # Predicted steady-state BEFORE EQ with half-octave splice
+        # Predicted steady-state BEFORE EQ
         zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
         predicted_before_3rd = \
             predict_post_eq_steady_state_third_octave(
@@ -290,7 +290,7 @@ if uploaded_files and st.button("Run Analysis"):
                 transition_hz=transition_hz,
                 half_octave_overlap=True)
 
-        # Predicted steady-state AFTER EQ with half-octave splice
+        # Predicted steady-state AFTER EQ
         predicted_after_3rd = \
             predict_post_eq_steady_state_third_octave(
                 direct_levels_3rd,
@@ -577,7 +577,8 @@ if uploaded_files and st.button("Run Analysis"):
             "not an EQ problem.")
 
         oct_bands_display = [
-            63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+            63, 125, 250, 500, 1000,
+            2000, 4000, 8000, 16000]
         ver_rows = []
         for b in oct_bands_display:
             nearest = min(
@@ -720,4 +721,72 @@ if uploaded_files and st.button("Run Analysis"):
         st.metric("IR files processed", len(irs))
     with col4:
         valid_rt60 = [v for v in rt60_bands.values()
-                      if v is not None
+                      if v is not None]
+        avg_rt60 = np.mean(valid_rt60) if valid_rt60 else 0.0
+        st.metric("Mean RT60", f"{avg_rt60:.2f} s")
+
+    # ---------------------------------------------------------------
+    # Results table
+    # ---------------------------------------------------------------
+
+    st.header("7. Results Table")
+    st.dataframe(df)
+
+    # ---------------------------------------------------------------
+    # Downloads
+    # ---------------------------------------------------------------
+
+    st.header("8. Downloads")
+
+    st.subheader("Smaart Reference Curve Files")
+    st.caption(
+        "Import these files into Smaart via "
+        "Options → Reference Curves → Import. "
+        "The curves are anchored to the measured direct field "
+        "level at 1 kHz so they will align correctly when "
+        "overlaid on a transfer function measurement at the "
+        "same gain setting.")
+
+    col1, col2, col3 = st.columns(3)
+
+    if eq_target_path.exists():
+        with col1:
+            st.download_button(
+                label="EQ target curve (Smaart)",
+                data=eq_target_path.read_bytes(),
+                file_name=eq_target_path.name,
+                mime="text/plain",
+                help=(
+                    "Predicted steady-state response after EQ. "
+                    "Use as a reference curve in Smaart to "
+                    "guide equalisation."))
+
+    if xcurve_export_path.exists():
+        with col2:
+            st.download_button(
+                label=(
+                    f"X-curve "
+                    f"({'large' if xcurve_size == 'large' else 'small'}"
+                    f" room, Smaart)"),
+                data=xcurve_export_path.read_bytes(),
+                file_name=xcurve_export_path.name,
+                mime="text/plain",
+                help=(
+                    "SMPTE ST 202M / ISO 2969 X-curve aligned "
+                    "to the measured direct field level at "
+                    f"{xcurve_ref_band} Hz."))
+
+    csv_path = out_dir / f"{channel_name}_results.csv"
+    if csv_path.exists():
+        with col3:
+            st.download_button(
+                label="Results CSV",
+                data=csv_path.read_bytes(),
+                file_name=csv_path.name,
+                mime="text/csv",
+                help=(
+                    "Full per-band results including direct "
+                    "field, reverberant field, RT60, DI, and "
+                    "EQ corrections."))
+
+    shutil.rmtree(tmp_dir)
