@@ -1,174 +1,628 @@
-# ---------------------------------------------------------------------------
-# Third octave band definitions
-# ---------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+Streamlit front end for reverberant field analysis and EQ derivation.
+"""
 
-THIRD_OCTAVE_CENTRES = np.array([
-    20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160,
-    200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600,
-    2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000
-])
+import streamlit as st
+import tempfile
+import shutil
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
+from di_analysis import (
+    load_ir,
+    apply_calibration,
+    direct_field_at_bands,
+    direct_field_at_third_octave_bands,
+    gated_direct_field,
+    rt60_per_band_from_irs,
+    spatial_average_reverberant,
+    spatial_average_reverberant_third_octave,
+    estimate_di,
+    derive_full_eq_target,
+    predict_post_eq_steady_state_third_octave,
+    design_fir_filter,
+    design_lf_iir_filters,
+    plot_analysis,
+    plot_eq_and_filter,
+    save_fir_coefficients,
+    save_iir_parameters,
+    save_csv,
+    xcurve_at_third_octave_bands,
+    interpolate_correction_to_freqs,
+    OCTAVE_CENTRES,
+    THIRD_OCTAVE_CENTRES,
+    validate_rt60,
+)
 
-def third_octave_band_limits(centre_hz):
-    """Return (f_low, f_high) for a 1/3-octave band centred at centre_hz."""
-    return centre_hz / (2 ** (1.0 / 6)), centre_hz * (2 ** (1.0 / 6))
+st.set_page_config(
+    page_title="Room Analysis and EQ Tool",
+    layout="wide")
 
-
-def direct_field_at_third_octave_bands(ir, fs, gate_ms=None,
-                                        bands=THIRD_OCTAVE_CENTRES):
-    """
-    Return the mean direct field level in each 1/3-octave band.
-    Uses the same gated direct field spectrum as the octave band
-    version but averages into 1/3-octave bins.
-    Returns levels dict and gate_ms_used.
-    """
-    freqs, magnitude, gate_ms_used = gated_direct_field(ir, fs, gate_ms)
-    levels = {}
-    for b in bands:
-        f_low, f_high = third_octave_band_limits(b)
-        mask = (freqs >= f_low) & (freqs < f_high)
-        if mask.sum() > 0:
-            power = 10.0 ** (magnitude[mask] / 10.0)
-            levels[float(b)] = float(10.0 * np.log10(np.mean(power)))
-        else:
-            levels[float(b)] = np.nan
-    return levels, gate_ms_used
-
-
-def reverberant_spectrum_third_octave(ir, fs,
-                                       bands=THIRD_OCTAVE_CENTRES):
-    """
-    Return the Schroeder initial decay level for each 1/3-octave band.
-    """
-    result = {}
-    for b in bands:
-        f_low, f_high = third_octave_band_limits(b)
-        ir_band = bandpass_ir(ir, fs, f_low, f_high)
-        direct_idx = detect_direct_arrival(ir_band, fs,
-                                            threshold_db=-20)
-        ir_band = ir_band[direct_idx:]
-        ir_band = truncate_to_noise_floor(ir_band)
-        decay_db = schroeder_decay(ir_band)
-        n_avg = max(1, int(0.005 * fs))
-        result[float(b)] = float(np.mean(decay_db[:n_avg]))
-    return result
-
-
-def spatial_average_reverberant_third_octave(ir_list, fs,
-                                              bands=THIRD_OCTAVE_CENTRES):
-    """
-    Spatially averaged reverberant field in 1/3-octave bands.
-    Averaging is performed in the power domain.
-    """
-    all_spectra = [
-        reverberant_spectrum_third_octave(ir, fs, bands)
-        for ir in ir_list]
-    averaged = {}
-    for b in bands:
-        b = float(b)
-        levels_db = [s[b] for s in all_spectra]
-        powers = [10.0 ** (l / 10.0) for l in levels_db]
-        averaged[b] = float(10.0 * np.log10(np.mean(powers)))
-    return averaged
-
-
-def predict_post_eq_steady_state_third_octave(
-        direct_levels_3rd, reverberant_levels_3rd,
-        all_corrections_octave,
-        bands=THIRD_OCTAVE_CENTRES):
-    """
-    Predict the steady-state response in 1/3-octave bands after
-    applying the octave band EQ corrections.
-
-    The octave band corrections are interpolated to 1/3-octave
-    resolution in log frequency space before being applied.
-    """
-    # Interpolate octave band corrections to 1/3-octave centres
-    oct_bands = sorted(all_corrections_octave.keys())
-    oct_corr = [all_corrections_octave[b] for b in oct_bands]
-
-    band_floats = [float(b) for b in bands]
-    log_oct = np.log10([float(b) for b in oct_bands])
-    log_third = np.log10(band_floats)
-    interp_corr = np.interp(log_third, log_oct, oct_corr,
-                             left=oct_corr[0], right=oct_corr[-1])
-
-    predicted = {}
-    for i, b in enumerate(band_floats):
-        d = direct_levels_3rd.get(b, np.nan)
-        r = reverberant_levels_3rd.get(b, np.nan)
-        c = float(interp_corr[i])
-        if np.isnan(d) or np.isnan(r):
-            predicted[b] = np.nan
-            continue
-        d_eq = d + c
-        r_eq = r + c
-        ss = 10.0 * np.log10(
-            10.0 ** (d_eq / 10.0) + 10.0 ** (r_eq / 10.0))
-        predicted[b] = round(ss, 2)
-    return predicted
-
+st.title("Reverberant Field Analysis and EQ Target Derivation")
 
 # ---------------------------------------------------------------------------
-# X-curve target (SMPTE ST 202M / ISO 2969)
+# Sidebar: room configuration
 # ---------------------------------------------------------------------------
 
-def xcurve_target(freqs_hz, screen_size='large'):
-    """
-    Generate the X-curve target level at each frequency in freqs_hz.
+st.sidebar.header("Room Configuration")
 
-    SMPTE ST 202M / ISO 2969 X-curve definition:
-      Flat from 2 Hz to 2 kHz (0 dB reference)
-      Roll off above 2 kHz at -3 dB per octave
-      Roll off below 63 Hz at -3 dB per octave
+room_name = st.sidebar.text_input(
+    "Room name", value="Stage A")
 
-    Two variants are provided:
-      large:  Standard X-curve for rooms > 150 m3
-              (large dubbing stages and cinemas)
-      small:  Modified X-curve for rooms < 150 m3
-              Flat extended to 4 kHz before rolloff
-              as per SMPTE RP 200
+st.sidebar.subheader("Room Dimensions")
 
-    Returns array of target levels in dB at each frequency in freqs_hz.
-    """
-    freqs = np.asarray(freqs_hz, dtype=float)
-    target = np.zeros_like(freqs)
+room_length = st.sidebar.number_input(
+    "Length (m)",
+    min_value=1.0, max_value=200.0, value=20.0, step=0.5)
+room_width = st.sidebar.number_input(
+    "Width (m)",
+    min_value=1.0, max_value=100.0, value=15.0, step=0.5)
+room_height = st.sidebar.number_input(
+    "Height (m)",
+    min_value=1.0, max_value=30.0, value=8.0, step=0.5)
 
-    if screen_size == 'small':
-        # Modified X-curve: flat to 4 kHz, -3 dB/oct above
-        hf_corner = 4000.0
-    else:
-        # Standard X-curve: flat to 2 kHz, -3 dB/oct above
-        hf_corner = 2000.0
+volume = room_length * room_width * room_height
+surface = 2.0 * (
+    room_length * room_width +
+    room_length * room_height +
+    room_width * room_height)
 
-    lf_corner = 63.0
+st.sidebar.metric("Volume (m³)", f"{volume:.1f}")
+st.sidebar.metric("Surface area (m²)", f"{surface:.1f}")
 
-    for i, f in enumerate(freqs):
-        if f <= 0:
-            target[i] = np.nan
-            continue
-        level = 0.0
-        # HF rolloff above corner frequency
-        if f > hf_corner:
-            octaves_above = np.log2(f / hf_corner)
-            level -= 3.0 * octaves_above
-        # LF rolloff below 63 Hz
-        if f < lf_corner:
-            octaves_below = np.log2(lf_corner / f)
-            level -= 3.0 * octaves_below
-        target[i] = level
+st.sidebar.subheader("Measurement Settings")
 
-    return target
+n_taps = st.sidebar.selectbox(
+    "FIR filter taps", [512, 1024, 2048, 4096], index=1)
 
+st.sidebar.info(
+    "Transition frequency between gated direct field "
+    "and spatial average is calculated automatically "
+    "from the detected gate length after measurement.")
 
-def xcurve_at_third_octave_bands(bands=THIRD_OCTAVE_CENTRES,
-                                  screen_size='large'):
-    """
-    Return the X-curve target level at each 1/3-octave band centre.
-    Returns dict {centre_hz: target_db}.
-    """
-    levels = xcurve_target(np.array(bands, dtype=float),
-                            screen_size=screen_size)
-    return {float(b): float(l)
-            for b, l in zip(bands, levels)
-            if not np.isnan(l)}
+st.sidebar.header("Channel Configuration")
+
+channel_name = st.sidebar.text_input(
+    "Channel name", value="Left")
+gate_ms_input = st.sidebar.number_input(
+    "Gate length ms (0 = auto)",
+    min_value=0.0, max_value=100.0, value=0.0, step=0.5)
+gate_ms = None if gate_ms_input == 0.0 else gate_ms_input
+
+hf_shelf_hz = st.sidebar.number_input(
+    "HF shelf frequency (Hz)",
+    min_value=4000, max_value=16000, value=10000, step=1000)
+hf_shelf_db = st.sidebar.number_input(
+    "HF shelf level (dB)",
+    min_value=-6.0, max_value=0.0, value=0.0, step=0.5)
+
+st.sidebar.header("Target Curve")
+
+show_xcurve = st.sidebar.checkbox(
+    "Show X-curve target", value=False)
+
+xcurve_size = st.sidebar.radio(
+    "X-curve variant",
+    options=["large", "small"],
+    index=0,
+    help=(
+        "Large: standard X-curve for rooms > 150 m³ "
+        "(SMPTE ST 202M / ISO 2969). "
+        "Small: modified X-curve for rooms < 150 m³ "
+        "(SMPTE RP 200), flat extended to 4 kHz."))
+
+xcurve_ref_band = st.sidebar.number_input(
+    "X-curve reference band (Hz)",
+    min_value=500, max_value=2000, value=1000, step=100,
+    help=(
+        "The X-curve will be aligned to the measured direct "
+        "field level at this frequency. Typically 1 kHz."))
+
+# ---------------------------------------------------------------------------
+# Main panel: file upload
+# ---------------------------------------------------------------------------
+
+st.header("1. Upload Impulse Response Files")
+
+st.info(
+    "Upload WAV files exported from Smaart. "
+    "The first file is treated as the reference position. "
+    "All remaining files are used for spatial averaging.")
+
+uploaded_files = st.file_uploader(
+    "IR WAV files (upload all positions for this channel)",
+    type=["wav"],
+    accept_multiple_files=True)
+
+cal_file = st.file_uploader(
+    "Microphone calibration file for reference position "
+    "(two-column CSV: frequency_hz, sensitivity_db — optional)",
+    type=["csv"])
+
+# ---------------------------------------------------------------------------
+# Process
+# ---------------------------------------------------------------------------
+
+if uploaded_files and st.button("Run Analysis"):
+
+    with st.spinner("Processing..."):
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        out_dir = tmp_dir / "output"
+        out_dir.mkdir()
+
+        ir_paths = []
+        for uf in uploaded_files:
+            p = tmp_dir / uf.name
+            p.write_bytes(uf.read())
+            ir_paths.append(p)
+
+        cal_path = None
+        if cal_file:
+            cal_path = tmp_dir / cal_file.name
+            cal_path.write_bytes(cal_file.read())
+
+        irs = []
+        ref_ir = None
+        ref_fs = None
+
+        for i, p in enumerate(sorted(ir_paths)):
+            ir, fs = load_ir(str(p))
+            if i == 0:
+                if cal_path:
+                    ir = apply_calibration(ir, fs, str(cal_path))
+                ref_ir = ir
+                ref_fs = fs
+            irs.append(ir)
+
+        st.success(f"Loaded {len(irs)} IR files at {ref_fs} Hz")
+
+        # ---------------------------------------------------------------
+        # Octave band analysis (used for EQ derivation and DI)
+        # ---------------------------------------------------------------
+
+        direct_levels, gate_ms_used = direct_field_at_bands(
+            ref_ir, ref_fs, gate_ms=gate_ms)
+
+        # Transition frequency from gate
+        transition_hz = max(125, int(2.0 / (gate_ms_used / 1000.0)))
+        transition_hz = int(min(
+            [b for b in OCTAVE_CENTRES if b >= transition_hz],
+            default=250))
+
+        st.info(
+            f"Gate detected: {gate_ms_used:.1f} ms — "
+            f"transition frequency set to {transition_hz} Hz")
+
+        room_cfg = {
+            'volume_m3': volume,
+            'surface_area_m2': surface,
+            'transition_hz': transition_hz,
+            'fir_taps': n_taps,
+            'microphone_calibration': [],
+        }
+        channel_cfg = {
+            'name': channel_name,
+            'gate_ms': gate_ms,
+            'hf_shelf_hz': hf_shelf_hz,
+            'hf_shelf_db': hf_shelf_db,
+        }
+
+        rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
+
+        rt60_warnings = validate_rt60(rt60_bands)
+
+        reverb_levels = spatial_average_reverberant(irs, ref_fs)
+
+        di = estimate_di(
+            direct_levels, reverb_levels,
+            rt60_bands, volume, surface)
+
+        hf_corr, lf_corr, all_corr, predicted_oct = derive_full_eq_target(
+            direct_levels, reverb_levels, reverb_levels,
+            rt60_bands, room_cfg, channel_cfg,
+            transition_hz=transition_hz)
+
+        fir_coeffs, fir_freq_response = design_fir_filter(
+            hf_corr, ref_fs, n_taps=n_taps,
+            transition_hz=transition_hz)
+
+        sos, lf_filter_params = design_lf_iir_filters(
+            lf_corr, ref_fs, transition_hz=transition_hz)
+
+        # ---------------------------------------------------------------
+        # 1/3 octave band analysis (used for display only)
+        # ---------------------------------------------------------------
+
+        direct_levels_3rd, _ = direct_field_at_third_octave_bands(
+            ref_ir, ref_fs, gate_ms=gate_ms)
+
+        reverb_levels_3rd = spatial_average_reverberant_third_octave(
+            irs, ref_fs)
+
+        # Predicted steady-state BEFORE EQ in 1/3 octave bands
+        # (no corrections applied — zero correction dict)
+        zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
+        predicted_before_3rd = predict_post_eq_steady_state_third_octave(
+            direct_levels_3rd, reverb_levels_3rd,
+            zero_corr)
+
+        # Predicted steady-state AFTER EQ in 1/3 octave bands
+        predicted_after_3rd = predict_post_eq_steady_state_third_octave(
+            direct_levels_3rd, reverb_levels_3rd,
+            all_corr)
+
+        # ---------------------------------------------------------------
+        # X-curve target aligned to measured direct field at ref band
+        # ---------------------------------------------------------------
+
+        xcurve_raw = xcurve_at_third_octave_bands(
+            bands=THIRD_OCTAVE_CENTRES,
+            screen_size=xcurve_size)
+
+        # Find the direct field level at the reference band
+        # by interpolating the 1/3-octave direct field to xcurve_ref_band
+        third_oct_sorted = sorted(direct_levels_3rd.keys())
+        direct_vals_sorted = [direct_levels_3rd[b]
+                               for b in third_oct_sorted]
+        ref_direct_level = float(np.interp(
+            np.log10(xcurve_ref_band),
+            np.log10(third_oct_sorted),
+            direct_vals_sorted))
+
+        # X-curve is defined relative to 0 dB at its flat region
+        # Shift it so that 0 dB on the X-curve aligns to the
+        # measured direct field level at the reference band
+        xcurve_aligned = {
+            b: v + ref_direct_level
+            for b, v in xcurve_raw.items()}
+
+        # Normalise all 1/3 octave traces to 0 dB at 1 kHz
+        # for consistent display
+        ref_level_3rd = direct_levels_3rd.get(1000.0, 0.0) or 0.0
+
+        direct_3rd_norm = {
+            b: v - ref_level_3rd
+            for b, v in direct_levels_3rd.items()}
+        reverb_3rd_norm = {
+            b: v - ref_level_3rd
+            for b, v in reverb_levels_3rd.items()}
+        before_3rd_norm = {
+            b: v - ref_level_3rd
+            for b, v in predicted_before_3rd.items()
+            if not np.isnan(v)}
+        after_3rd_norm = {
+            b: v - ref_level_3rd
+            for b, v in predicted_after_3rd.items()
+            if not np.isnan(v)}
+        xcurve_norm = {
+            b: v - ref_direct_level
+            for b, v in xcurve_aligned.items()}
+
+        # Save filter files and CSV
+        save_fir_coefficients(
+            fir_coeffs, channel_name, ref_fs, str(out_dir))
+        save_iir_parameters(
+            lf_filter_params, channel_name, str(out_dir))
+        df = save_csv(
+            direct_levels, reverb_levels, di, rt60_bands,
+            all_corr, predicted_oct, channel_name, str(out_dir))
+
+        # Static matplotlib plots for download
+        plot_analysis(
+            direct_levels, reverb_levels, di, rt60_bands,
+            gate_ms_used, channel_name, str(out_dir))
+        plot_eq_and_filter(
+            direct_levels, reverb_levels, all_corr,
+            predicted_oct, fir_freq_response, lf_filter_params,
+            channel_name, str(out_dir))
+
+    # ---------------------------------------------------------------
+    # RT60 warnings
+    # ---------------------------------------------------------------
+
+    if rt60_warnings:
+        st.warning("RT60 validation warnings:")
+        for band, msg in rt60_warnings.items():
+            st.write(f"  **{band} Hz:** {msg}")
+
+    # ---------------------------------------------------------------
+    # Main response plot — 1/3 octave bands
+    # ---------------------------------------------------------------
+
+    st.header("2. Measured Response and Target")
+
+    def make_third_oct_trace(levels_dict, name, colour,
+                              dash='solid', width=2, opacity=1.0):
+        """Build a Plotly scatter trace from a 1/3-octave dict."""
+        bands_sorted = sorted(levels_dict.keys())
+        x = [float(b) for b in bands_sorted]
+        y = [levels_dict[b] for b in bands_sorted]
+        return go.Scatter(
+            x=x, y=y,
+            mode='lines+markers',
+            name=name,
+            line=dict(color=colour, dash=dash, width=width),
+            marker=dict(size=5),
+            opacity=opacity)
+
+    fig_main = go.Figure()
+
+    # Direct field — 1/3 octave
+    fig_main.add_trace(make_third_oct_trace(
+        direct_3rd_norm,
+        'Direct field (1/3 oct)',
+        'steelblue',
+        width=2))
+
+    # Reverberant field — 1/3 octave
+    fig_main.add_trace(make_third_oct_trace(
+        reverb_3rd_norm,
+        'Reverberant field (spatially averaged)',
+        'firebrick',
+        dash='dash',
+        width=1.5,
+        opacity=0.7))
+
+    # Predicted steady-state BEFORE EQ
+    fig_main.add_trace(make_third_oct_trace(
+        before_3rd_norm,
+        'Predicted steady-state before EQ',
+        'grey',
+        dash='dot',
+        width=1.5,
+        opacity=0.8))
+
+    # Predicted steady-state AFTER EQ
+    fig_main.add_trace(make_third_oct_trace(
+        after_3rd_norm,
+        'Predicted steady-state after EQ',
+        'darkorange',
+        width=2))
+
+    # Flat target at 0 dB
+    flat_target = {float(b): 0.0 for b in THIRD_OCTAVE_CENTRES
+                   if float(b) >= 63}
+    fig_main.add_trace(make_third_oct_trace(
+        flat_target,
+        'Flat target',
+        'green',
+        dash='dot',
+        width=1.5,
+        opacity=0.6))
+
+    # X-curve target (optional)
+    if show_xcurve:
+        label = (f'X-curve target '
+                 f'({"large" if xcurve_size == "large" else "small"} '
+                 f'room, SMPTE ST 202M / ISO 2969)')
+        fig_main.add_trace(make_third_oct_trace(
+            xcurve_norm,
+            label,
+            'purple',
+            dash='dashdot',
+            width=2))
+
+    fig_main.update_layout(
+        title=(f"{channel_name} — "
+               f"Measured Response and Target (1/3 octave bands)"),
+        xaxis=dict(
+            title='Frequency (Hz)',
+            type='log',
+            tickvals=[
+                20, 31.5, 63, 125, 250, 500,
+                1000, 2000, 4000, 8000, 16000],
+            ticktext=[
+                '20', '31.5', '63', '125', '250', '500',
+                '1k', '2k', '4k', '8k', '16k'],
+            range=[np.log10(20), np.log10(20000)]),
+        yaxis=dict(
+            title='Level (dB, normalised at 1 kHz)',
+            range=[-25, 15]),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=-0.35,
+            xanchor='left',
+            x=0),
+        height=550,
+        hovermode='x unified')
+
+    st.plotly_chart(fig_main, use_container_width=True)
+
+    # X-curve annotation
+    if show_xcurve:
+        st.caption(
+            "X-curve: flat to "
+            + ("2 kHz" if xcurve_size == "large" else "4 kHz")
+            + ", then −3 dB/octave. "
+            "LF rolloff below 63 Hz at −3 dB/octave. "
+            "Reference: SMPTE ST 202M / ISO 2969"
+            + (" (modified for small rooms, SMPTE RP 200)."
+               if xcurve_size == "small" else "."))
+
+    # ---------------------------------------------------------------
+    # EQ correction and filter plot
+    # ---------------------------------------------------------------
+
+    st.header("3. EQ Correction and Filter Response")
+
+    fig_eq = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            'EQ Correction per Octave Band',
+            'FIR Filter Frequency Response'))
+
+    bands_sorted = sorted(all_corr.keys())
+    corr_vals = [all_corr[b] for b in bands_sorted]
+    colours = ['tomato' if v < 0 else 'steelblue'
+               for v in corr_vals]
+
+    fig_eq.add_trace(
+        go.Bar(
+            x=[str(b) for b in bands_sorted],
+            y=corr_vals,
+            marker_color=colours,
+            name='EQ correction (dB)'),
+        row=1, col=1)
+
+    fig_eq.add_hline(
+        y=0, line_dash='dot',
+        line_color='grey', row=1, col=1)
+
+    fir_freqs, fir_mag = fir_freq_response
+    fir_mask = fir_freqs > 20
+    fig_eq.add_trace(
+        go.Scatter(
+            x=fir_freqs[fir_mask],
+            y=fir_mag[fir_mask],
+            mode='lines',
+            name='FIR filter response',
+            line=dict(color='darkorange', width=1.5)),
+        row=1, col=2)
+
+    fig_eq.add_hline(
+        y=0, line_dash='dot',
+        line_color='grey', row=1, col=2)
+
+    fig_eq.update_xaxes(
+        type='log',
+        tickvals=[63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+        ticktext=['63', '125', '250', '500', '1k',
+                  '2k', '4k', '8k', '16k'],
+        row=1, col=2)
+
+    fig_eq.update_yaxes(
+        title_text='Correction (dB)', row=1, col=1)
+    fig_eq.update_yaxes(
+        title_text='Filter magnitude (dB)', row=1, col=2)
+    fig_eq.update_layout(height=400)
+
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    # ---------------------------------------------------------------
+    # RT60 and DI plots
+    # ---------------------------------------------------------------
+
+    st.header("4. RT60 and Directivity Index")
+
+    fig_rt_di = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            'RT60 per Octave Band',
+            'Estimated Directivity Index DI(f)'))
+
+    rt60_bands_sorted = sorted(
+        b for b in rt60_bands if rt60_bands[b] is not None)
+    rt60_vals = [rt60_bands[b] for b in rt60_bands_sorted]
+
+    fig_rt_di.add_trace(
+        go.Bar(
+            x=[str(b) for b in rt60_bands_sorted],
+            y=rt60_vals,
+            marker_color='mediumseagreen',
+            name='RT60 (s)'),
+        row=1, col=1)
+
+    di_sorted = sorted(
+        b for b in di if not np.isnan(di.get(b, np.nan)))
+    di_vals = [di[b] for b in di_sorted]
+
+    fig_rt_di.add_trace(
+        go.Scatter(
+            x=[str(b) for b in di_sorted],
+            y=di_vals,
+            mode='lines+markers',
+            name='DI estimate (dB)',
+            line=dict(color='mediumpurple', width=2),
+            marker=dict(size=8)),
+        row=1, col=2)
+
+    fig_rt_di.update_yaxes(
+        title_text='RT60 (s)', row=1, col=1)
+    fig_rt_di.update_yaxes(
+        title_text='DI (dB)', row=1, col=2)
+    fig_rt_di.update_layout(height=400)
+
+    st.plotly_chart(fig_rt_di, use_container_width=True)
+
+    # ---------------------------------------------------------------
+    # Summary metrics
+    # ---------------------------------------------------------------
+
+    st.header("5. Measurement Summary")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Gate length", f"{gate_ms_used:.1f} ms")
+    with col2:
+        st.metric("Transition frequency", f"{transition_hz} Hz")
+    with col3:
+        st.metric("IR files processed", len(irs))
+    with col4:
+        valid_rt60 = [v for v in rt60_bands.values()
+                      if v is not None]
+        avg_rt60 = np.mean(valid_rt60) if valid_rt60 else 0.0
+        st.metric("Mean RT60", f"{avg_rt60:.2f} s")
+
+    # ---------------------------------------------------------------
+    # Results table
+    # ---------------------------------------------------------------
+
+    st.header("6. Results Table")
+    st.dataframe(df)
+
+    if lf_filter_params:
+        st.header("7. LF IIR Filter Parameters")
+        st.dataframe(pd.DataFrame(lf_filter_params))
+
+    # ---------------------------------------------------------------
+    # Downloads
+    # ---------------------------------------------------------------
+
+    st.header("8. Download Filter Files")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    fir_txt = out_dir / f"{channel_name}_fir.txt"
+    fir_wav = out_dir / f"{channel_name}_fir.wav"
+    csv_path = out_dir / f"{channel_name}_results.csv"
+    iir_path = out_dir / f"{channel_name}_iir_params.csv"
+
+    if fir_txt.exists():
+        with col1:
+            st.download_button(
+                "FIR coefficients (text)",
+                data=fir_txt.read_bytes(),
+                file_name=fir_txt.name,
+                mime="text/plain")
+
+    if fir_wav.exists():
+        with col2:
+            st.download_button(
+                "FIR as WAV (for FIR Designer)",
+                data=fir_wav.read_bytes(),
+                file_name=fir_wav.name,
+                mime="audio/wav")
+
+    if csv_path.exists():
+        with col3:
+            st.download_button(
+                "Results CSV",
+                data=csv_path.read_bytes(),
+                file_name=csv_path.name,
+                mime="text/csv")
+
+    if iir_path.exists():
+        with col4:
+            st.download_button(
+                "IIR parameters CSV",
+                data=iir_path.read_bytes(),
+                file_name=iir_path.name,
+                mime="text/csv")
+
+    shutil.rmtree(tmp_dir)
