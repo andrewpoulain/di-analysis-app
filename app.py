@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit front end for reverberant field analysis and EQ derivation.
+Streamlit front end for reverberant field analysis and EQ target derivation.
 """
 
 import streamlit as st
@@ -17,29 +17,23 @@ from di_analysis import (
     apply_calibration,
     direct_field_at_bands,
     direct_field_at_third_octave_bands,
-    gated_direct_field,
     rt60_per_band_from_irs,
     spatial_average_reverberant,
     spatial_average_reverberant_third_octave,
     estimate_di,
     derive_full_eq_target,
     predict_post_eq_steady_state_third_octave,
-    design_fir_filter,
-    design_lf_iir_filters,
-    plot_analysis,
-    plot_eq_and_filter,
-    save_fir_coefficients,
-    save_iir_parameters,
     save_csv,
     xcurve_at_third_octave_bands,
-    interpolate_correction_to_freqs,
+    export_target_for_smaart,
+    export_xcurve_for_smaart,
     validate_rt60,
     OCTAVE_CENTRES,
     THIRD_OCTAVE_CENTRES,
 )
 
 st.set_page_config(
-    page_title="Room Analysis and EQ Tool",
+    page_title="Room Analysis and EQ Target Tool",
     layout="wide")
 
 st.title("Reverberant Field Analysis and EQ Target Derivation")
@@ -76,9 +70,6 @@ st.sidebar.metric("Surface area (m²)", f"{surface:.1f}")
 
 st.sidebar.subheader("Measurement Settings")
 
-n_taps = st.sidebar.selectbox(
-    "FIR filter taps", [512, 1024, 2048, 4096], index=1)
-
 st.sidebar.info(
     "Transition frequency between gated direct field "
     "and spatial average is calculated automatically "
@@ -100,7 +91,7 @@ hf_shelf_db = st.sidebar.number_input(
     "HF shelf level (dB)",
     min_value=-6.0, max_value=0.0, value=0.0, step=0.5)
 
-st.sidebar.header("Target Curve")
+st.sidebar.header("Target Curve Options")
 
 show_xcurve = st.sidebar.checkbox(
     "Show X-curve target", value=False)
@@ -130,8 +121,10 @@ st.header("1. Upload Impulse Response Files")
 
 st.info(
     "Upload WAV files exported from Smaart. "
-    "The first file is treated as the reference position. "
-    "All remaining files are used for spatial averaging.")
+    "The first file (alphabetically) is treated as the "
+    "reference position for the direct field measurement. "
+    "All files are used for spatial averaging of the "
+    "reverberant field.")
 
 uploaded_files = st.file_uploader(
     "IR WAV files (upload all positions for this channel)",
@@ -149,12 +142,14 @@ cal_file = st.file_uploader(
 
 if uploaded_files and st.button("Run Analysis"):
 
-    with st.spinner("Processing..."):
+    with st.spinner("Processing — this may take a moment "
+                    "for multiple IR files..."):
 
         tmp_dir = Path(tempfile.mkdtemp())
         out_dir = tmp_dir / "output"
         out_dir.mkdir()
 
+        # Save uploaded files to temp directory
         ir_paths = []
         for uf in uploaded_files:
             p = tmp_dir / uf.name
@@ -166,6 +161,7 @@ if uploaded_files and st.button("Run Analysis"):
             cal_path = tmp_dir / cal_file.name
             cal_path.write_bytes(cal_file.read())
 
+        # Load IRs
         irs = []
         ref_ir = None
         ref_fs = None
@@ -179,15 +175,17 @@ if uploaded_files and st.button("Run Analysis"):
                 ref_fs = fs
             irs.append(ir)
 
-        st.success(f"Loaded {len(irs)} IR files at {ref_fs} Hz")
+        st.success(
+            f"Loaded {len(irs)} IR file(s) at {ref_fs} Hz")
 
         # -----------------------------------------------------------
-        # Octave band analysis — used for EQ derivation and DI
+        # Octave band analysis — EQ derivation and DI
         # -----------------------------------------------------------
 
         direct_levels, gate_ms_used = direct_field_at_bands(
             ref_ir, ref_fs, gate_ms=gate_ms)
 
+        # Transition frequency from gate length
         transition_hz = max(
             125, int(2.0 / (gate_ms_used / 1000.0)))
         transition_hz = int(min(
@@ -198,13 +196,6 @@ if uploaded_files and st.button("Run Analysis"):
             f"Gate detected: {gate_ms_used:.1f} ms — "
             f"transition frequency set to {transition_hz} Hz")
 
-        room_cfg = {
-            'volume_m3': volume,
-            'surface_area_m2': surface,
-            'transition_hz': transition_hz,
-            'fir_taps': n_taps,
-            'microphone_calibration': [],
-        }
         channel_cfg = {
             'name': channel_name,
             'gate_ms': gate_ms,
@@ -214,27 +205,20 @@ if uploaded_files and st.button("Run Analysis"):
 
         rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
         rt60_warnings = validate_rt60(rt60_bands)
+
         reverb_levels = spatial_average_reverberant(irs, ref_fs)
 
         di = estimate_di(
             direct_levels, reverb_levels,
             rt60_bands, volume, surface)
 
-        hf_corr, lf_corr, all_corr, predicted_oct = \
-            derive_full_eq_target(
-                direct_levels, reverb_levels, reverb_levels,
-                rt60_bands, room_cfg, channel_cfg,
-                transition_hz=transition_hz)
-
-        fir_coeffs, fir_freq_response = design_fir_filter(
-            hf_corr, ref_fs, n_taps=n_taps,
+        hf_corr, lf_corr, all_corr = derive_full_eq_target(
+            direct_levels, reverb_levels, reverb_levels,
+            channel_cfg,
             transition_hz=transition_hz)
 
-        sos, lf_filter_params = design_lf_iir_filters(
-            lf_corr, ref_fs, transition_hz=transition_hz)
-
         # -----------------------------------------------------------
-        # 1/3 octave band analysis — used for display
+        # 1/3 octave band analysis — display
         # -----------------------------------------------------------
 
         direct_levels_3rd, _ = direct_field_at_third_octave_bands(
@@ -243,7 +227,7 @@ if uploaded_files and st.button("Run Analysis"):
         reverb_levels_3rd = \
             spatial_average_reverberant_third_octave(irs, ref_fs)
 
-        # Predicted steady-state BEFORE EQ
+        # Predicted steady-state BEFORE EQ (zero corrections)
         zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
         predicted_before_3rd = \
             predict_post_eq_steady_state_third_octave(
@@ -255,27 +239,24 @@ if uploaded_files and st.button("Run Analysis"):
                 direct_levels_3rd, reverb_levels_3rd, all_corr)
 
         # -----------------------------------------------------------
-        # X-curve aligned to measured direct field
+        # X-curve
         # -----------------------------------------------------------
 
         xcurve_raw = xcurve_at_third_octave_bands(
             bands=THIRD_OCTAVE_CENTRES,
             screen_size=xcurve_size)
 
+        # Align X-curve to measured direct field at reference band
         third_oct_sorted = sorted(direct_levels_3rd.keys())
-        direct_vals_sorted = [direct_levels_3rd[b]
-                               for b in third_oct_sorted]
+        direct_vals_sorted = [
+            direct_levels_3rd[b] for b in third_oct_sorted]
         ref_direct_level = float(np.interp(
             np.log10(float(xcurve_ref_band)),
             np.log10(third_oct_sorted),
             direct_vals_sorted))
 
-        xcurve_norm = {
-            b: v + ref_direct_level
-            for b, v in xcurve_raw.items()}
-
         # -----------------------------------------------------------
-        # Normalise all traces to 0 dB at 1 kHz
+        # Normalise all display traces to 0 dB at 1 kHz
         # -----------------------------------------------------------
 
         ref_level_3rd = direct_levels_3rd.get(1000.0, 0.0) or 0.0
@@ -283,39 +264,58 @@ if uploaded_files and st.button("Run Analysis"):
         direct_3rd_norm = {
             b: v - ref_level_3rd
             for b, v in direct_levels_3rd.items()}
+
         reverb_3rd_norm = {
             b: v - ref_level_3rd
             for b, v in reverb_levels_3rd.items()}
+
         before_3rd_norm = {
             b: v - ref_level_3rd
             for b, v in predicted_before_3rd.items()
             if not np.isnan(v)}
+
         after_3rd_norm = {
             b: v - ref_level_3rd
             for b, v in predicted_after_3rd.items()
             if not np.isnan(v)}
+
+        # X-curve display: normalised so 0 dB aligns to
+        # the flat region of the curve
         xcurve_display = {
-            b: v - ref_direct_level
-            for b, v in xcurve_norm.items()}
+            b: v
+            for b, v in xcurve_raw.items()}
 
         # -----------------------------------------------------------
-        # Save outputs
+        # Save CSV results
         # -----------------------------------------------------------
 
-        save_fir_coefficients(
-            fir_coeffs, channel_name, ref_fs, str(out_dir))
-        save_iir_parameters(
-            lf_filter_params, channel_name, str(out_dir))
         df = save_csv(
             direct_levels, reverb_levels, di, rt60_bands,
-            all_corr, predicted_oct, channel_name, str(out_dir))
-        plot_analysis(
-            direct_levels, reverb_levels, di, rt60_bands,
-            gate_ms_used, channel_name, str(out_dir))
-        plot_eq_and_filter(
-            direct_levels, reverb_levels, all_corr,
-            predicted_oct, fir_freq_response, lf_filter_params,
-            channel_name, str(out_dir))
+            all_corr, channel_name, str(out_dir))
+
+        # -----------------------------------------------------------
+        # Save Smaart export files
+        # -----------------------------------------------------------
+
+        # EQ target export
+        eq_target_path = out_dir / f"{channel_name}_eq_target.txt"
+        export_target_for_smaart(
+            target_levels_3rd=after_3rd_norm,
+            direct_levels_3rd=direct_levels_3rd,
+            ref_level_db=ref_level_3rd,
+            output_path=eq_target_path,
+            label=f'{channel_name} EQ Target — {room_name}')
+
+        # X-curve export
+        xcurve_export_path = (
+            out_dir /
+            f"{channel_name}_xcurve_"
+            f"{'large' if xcurve_size == 'large' else 'small'}.txt")
+        export_xcurve_for_smaart(
+            xcurve_levels_3rd=xcurve_raw,
+            ref_level_db=ref_direct_level,
+            output_path=xcurve_export_path,
+            screen_size=xcurve_size)
 
     # ---------------------------------------------------------------
     # RT60 warnings
@@ -390,9 +390,10 @@ if uploaded_files and st.button("Run Analysis"):
             'purple', dash='dashdot', width=2))
 
     fig_main.update_layout(
-        title=(f"{channel_name} — "
-               f"Measured Response and Target "
-               f"(1/3 octave bands)"),
+        title=(
+            f"{channel_name} — {room_name} — "
+            f"Measured Response and Target "
+            f"(1/3 octave bands)"),
         xaxis=dict(
             title='Frequency (Hz)',
             type='log',
@@ -428,64 +429,32 @@ if uploaded_files and st.button("Run Analysis"):
                if xcurve_size == "small" else "."))
 
     # ---------------------------------------------------------------
-    # EQ correction and filter plot
+    # EQ corrections chart
     # ---------------------------------------------------------------
 
-    st.header("3. EQ Correction and Filter Response")
+    st.header("3. Derived EQ Corrections")
 
-    fig_eq = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=(
-            'EQ Correction per Octave Band',
-            'FIR Filter Frequency Response'))
+    fig_eq = go.Figure()
 
     bands_sorted = sorted(all_corr.keys())
     corr_vals = [all_corr[b] for b in bands_sorted]
     colours = ['tomato' if v < 0 else 'steelblue'
                for v in corr_vals]
 
-    fig_eq.add_trace(
-        go.Bar(
-            x=[str(b) for b in bands_sorted],
-            y=corr_vals,
-            marker_color=colours,
-            name='EQ correction (dB)'),
-        row=1, col=1)
+    fig_eq.add_trace(go.Bar(
+        x=[str(b) for b in bands_sorted],
+        y=corr_vals,
+        marker_color=colours,
+        name='EQ correction (dB)'))
 
     fig_eq.add_hline(
-        y=0, line_dash='dot',
-        line_color='grey', row=1, col=1)
+        y=0, line_dash='dot', line_color='grey')
 
-    fir_freqs, fir_mag = fir_freq_response
-    fir_mask = fir_freqs > 20
-    fig_eq.add_trace(
-        go.Scatter(
-            x=fir_freqs[fir_mask],
-            y=fir_mag[fir_mask],
-            mode='lines',
-            name='FIR filter response',
-            line=dict(color='darkorange', width=1.5)),
-        row=1, col=2)
-
-    fig_eq.add_hline(
-        y=0, line_dash='dot',
-        line_color='grey', row=1, col=2)
-
-    fig_eq.update_xaxes(
-        type='log',
-        tickvals=[
-            63, 125, 250, 500, 1000,
-            2000, 4000, 8000, 16000],
-        ticktext=[
-            '63', '125', '250', '500', '1k',
-            '2k', '4k', '8k', '16k'],
-        row=1, col=2)
-
-    fig_eq.update_yaxes(
-        title_text='Correction (dB)', row=1, col=1)
-    fig_eq.update_yaxes(
-        title_text='Filter magnitude (dB)', row=1, col=2)
-    fig_eq.update_layout(height=400)
+    fig_eq.update_layout(
+        title='EQ Correction per Octave Band',
+        xaxis_title='Octave band (Hz)',
+        yaxis_title='Correction (dB)',
+        height=350)
 
     st.plotly_chart(fig_eq, width='stretch')
 
@@ -533,7 +502,7 @@ if uploaded_files and st.button("Run Analysis"):
         title_text='RT60 (s)', row=1, col=1)
     fig_rt_di.update_yaxes(
         title_text='DI (dB)', row=1, col=2)
-    fig_rt_di.update_layout(height=400)
+    fig_rt_di.update_layout(height=380)
 
     st.plotly_chart(fig_rt_di, width='stretch')
 
@@ -563,53 +532,60 @@ if uploaded_files and st.button("Run Analysis"):
     st.header("6. Results Table")
     st.dataframe(df)
 
-    if lf_filter_params:
-        st.header("7. LF IIR Filter Parameters")
-        st.dataframe(pd.DataFrame(lf_filter_params))
-
     # ---------------------------------------------------------------
     # Downloads
     # ---------------------------------------------------------------
 
-    st.header("8. Download Filter Files")
+    st.header("7. Downloads")
 
-    col1, col2, col3, col4 = st.columns(4)
+    st.subheader("Smaart Reference Curve Files")
+    st.caption(
+        "Import these files into Smaart via "
+        "Options → Reference Curves → Import. "
+        "The curves are anchored to the measured direct field "
+        "level at 1 kHz so they will align correctly when "
+        "overlaid on a transfer function measurement at the "
+        "same gain setting.")
 
-    fir_txt = out_dir / f"{channel_name}_fir.txt"
-    fir_wav = out_dir / f"{channel_name}_fir.wav"
-    csv_path = out_dir / f"{channel_name}_results.csv"
-    iir_path = out_dir / f"{channel_name}_iir_params.csv"
+    col1, col2, col3 = st.columns(3)
 
-    if fir_txt.exists():
+    if eq_target_path.exists():
         with col1:
             st.download_button(
-                "FIR coefficients (text)",
-                data=fir_txt.read_bytes(),
-                file_name=fir_txt.name,
-                mime="text/plain")
+                label="EQ target curve (Smaart)",
+                data=eq_target_path.read_bytes(),
+                file_name=eq_target_path.name,
+                mime="text/plain",
+                help=(
+                    "Predicted steady-state response after EQ. "
+                    "Use as a reference curve in Smaart to guide "
+                    "equalisation."))
 
-    if fir_wav.exists():
+    if xcurve_export_path.exists():
         with col2:
             st.download_button(
-                "FIR as WAV (for FIR Designer)",
-                data=fir_wav.read_bytes(),
-                file_name=fir_wav.name,
-                mime="audio/wav")
+                label=(
+                    f"X-curve target "
+                    f"({'large' if xcurve_size == 'large' else 'small'}"
+                    f" room, Smaart)"),
+                data=xcurve_export_path.read_bytes(),
+                file_name=xcurve_export_path.name,
+                mime="text/plain",
+                help=(
+                    "SMPTE ST 202M / ISO 2969 X-curve aligned to "
+                    "the measured direct field level at "
+                    f"{xcurve_ref_band} Hz."))
 
+    csv_path = out_dir / f"{channel_name}_results.csv"
     if csv_path.exists():
         with col3:
             st.download_button(
-                "Results CSV",
+                label="Results CSV",
                 data=csv_path.read_bytes(),
                 file_name=csv_path.name,
-                mime="text/csv")
-
-    if iir_path.exists():
-        with col4:
-            st.download_button(
-                "IIR parameters CSV",
-                data=iir_path.read_bytes(),
-                file_name=iir_path.name,
-                mime="text/csv")
+                mime="text/csv",
+                help=(
+                    "Full per-band results including direct field, "
+                    "reverberant field, RT60, DI, and EQ corrections."))
 
     shutil.rmtree(tmp_dir)
