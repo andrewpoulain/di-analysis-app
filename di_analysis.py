@@ -103,8 +103,8 @@ def air_absorption_at_bands(bands, throw_m,
                              temperature_c=20.0,
                              humidity_rh=50.0):
     """
-    Calculate air absorption loss in dB at each band centre frequency.
-    Returns dict {centre_hz: absorption_db}.
+    Calculate air absorption loss in dB at each band centre
+    frequency. Returns dict {centre_hz: absorption_db}.
     Absorption values are positive (represent a loss).
     """
     return {
@@ -259,23 +259,31 @@ def truncate_to_noise_floor(ir, margin_db=10.0):
 
 
 # ---------------------------------------------------------------------------
-# Schroeder integration
+# Bandpass filtering
 # ---------------------------------------------------------------------------
 
-def bandpass_ir(ir, fs, f_low, f_high):
+def bandpass_ir(ir, fs, f_low, f_high, order=4):
     """
-    Bandpass filter an IR using a 4th-order zero-phase Butterworth
-    filter. sosfiltfilt eliminates phase distortion.
+    Bandpass filter an IR using a zero-phase Butterworth filter.
+
+    order defaults to 4. Pass order=2 for low frequency bands
+    (63 Hz and below) to prevent sosfiltfilt ringing on
+    narrow-bandwidth IRs which would extend the apparent decay
+    and cause RT60 overestimation at low frequencies.
     """
     nyq = fs / 2.0
     f_low = max(f_low, 10.0)
     f_high = min(f_high, nyq * 0.99)
     if f_low >= f_high:
         return np.zeros_like(ir)
-    sos = sig.butter(4, [f_low / nyq, f_high / nyq],
+    sos = sig.butter(order, [f_low / nyq, f_high / nyq],
                      btype='band', output='sos')
     return sig.sosfiltfilt(sos, ir)
 
+
+# ---------------------------------------------------------------------------
+# Schroeder integration
+# ---------------------------------------------------------------------------
 
 def schroeder_decay(ir_band):
     """
@@ -300,14 +308,17 @@ def schroeder_decay(ir_band):
 def initial_decay_level(ir, fs, centre_hz):
     """
     Return the initial Schroeder decay level for one octave band.
-    Uses frequency-scaled truncation margin.
+    Uses frequency-scaled filter order and truncation margin.
     """
     f_low, f_high = octave_band_limits(centre_hz)
-    ir_band = bandpass_ir(ir, fs, f_low, f_high)
-    direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
+    order = 2 if centre_hz <= 63 else 4
+    ir_band = bandpass_ir(ir, fs, f_low, f_high, order=order)
+    direct_idx = detect_direct_arrival(
+        ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
     margin_db = truncation_margin_for_band(centre_hz)
-    ir_band = truncate_to_noise_floor(ir_band, margin_db=margin_db)
+    ir_band = truncate_to_noise_floor(
+        ir_band, margin_db=margin_db)
     decay_db = schroeder_decay(ir_band)
     n_avg = max(1, int(0.005 * fs))
     return float(np.mean(decay_db[:n_avg]))
@@ -329,31 +340,62 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     """
     Estimate RT60 in one octave band from the Schroeder decay curve.
 
-    Uses T20 as primary method, T30 as first fallback, EDT as last
-    resort. T20 is prioritised because TF-derived IRs from Smaart
-    using broadband noise excitation typically have lower SNR than
-    swept sine measurements.
+    Evaluation order is frequency-dependent:
 
-    The truncation margin is scaled with frequency via
-    truncation_margin_for_band() to prevent premature truncation
-    of short high-frequency decays.
+      Below 8 kHz:
+        T20 (-5 to -25 dB) primary — most robust for
+        noise-excited TF-derived IRs from Smaart
+        T30 (-5 to -35 dB) first fallback
+        EDT (0 to -10 dB) last resort
 
-    Returns RT60 in seconds, or None if the decay is unreliable.
+      8 kHz and above:
+        EDT (0 to -10 dB) primary — at very high frequencies
+        the IR dynamic range is insufficient for T20.
+        EDT uses the strongest part of the decay where SNR
+        is highest and gives more reliable results than
+        forcing T20 on a truncated decay.
+        T20 fallback
+        T30 last resort
+
+    Filter order is reduced to 2 at 63 Hz and below to prevent
+    sosfiltfilt ringing from extending the apparent decay and
+    causing RT60 overestimation.
+
+    The minimum slope threshold is relaxed at high frequencies
+    because short decays have steeper slopes and the standard
+    -0.5 dB/s threshold would reject valid fits.
+
+    Returns RT60 in seconds, or None if unreliable.
     """
     f_low, f_high = octave_band_limits(centre_hz)
-    ir_band = bandpass_ir(ir, fs, f_low, f_high)
+
+    # Reduce filter order at low frequencies to prevent
+    # sosfiltfilt ringing on narrow-bandwidth short IRs
+    order = 2 if centre_hz <= 63 else 4
+
+    nyq = fs / 2.0
+    fl = max(f_low, 10.0)
+    fh = min(f_high, nyq * 0.99)
+    if fl >= fh:
+        return None
+
+    sos = sig.butter(order, [fl / nyq, fh / nyq],
+                     btype='band', output='sos')
+    ir_band = sig.sosfiltfilt(sos, ir)
 
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
 
-    direct_idx = detect_direct_arrival(ir_band, fs, threshold_db=-20)
+    direct_idx = detect_direct_arrival(
+        ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
 
     if len(ir_band) < int(0.05 * fs):
         return None
 
     margin_db = truncation_margin_for_band(centre_hz)
-    ir_band = truncate_to_noise_floor(ir_band, margin_db=margin_db)
+    ir_band = truncate_to_noise_floor(
+        ir_band, margin_db=margin_db)
 
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
@@ -361,11 +403,24 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
 
-    eval_ranges = [
-        (-5, -25),   # T20 — primary
-        (-5, -35),   # T30 — first fallback
-        (0,  -10),   # EDT — last resort
-    ]
+    # Frequency-dependent evaluation order and slope threshold
+    if centre_hz >= 8000:
+        # EDT primary at HF — insufficient dynamic range for T20
+        eval_ranges = [
+            (0,   -10),   # EDT — primary at HF
+            (-5,  -25),   # T20 — fallback
+            (-5,  -35),   # T30 — last resort
+        ]
+        # Relax minimum slope threshold at HF
+        # Short decays have steeper slopes
+        min_slope = -0.1
+    else:
+        eval_ranges = [
+            (-5,  -25),   # T20 — primary
+            (-5,  -35),   # T30 — first fallback
+            (0,   -10),   # EDT — last resort
+        ]
+        min_slope = -0.5
 
     for lo, hi in eval_ranges:
         mask = (decay_db <= lo) & (decay_db >= hi)
@@ -377,7 +432,7 @@ def rt60_from_schroeder(ir, fs, centre_hz):
             continue
         coeffs = np.polyfit(t_region, d_region, 1)
         slope = coeffs[0]
-        if slope >= -0.5:
+        if slope >= min_slope:
             continue
         rt60 = -60.0 / slope
         if 0.05 <= rt60 <= 20.0:
@@ -499,7 +554,8 @@ def direct_field_at_bands(ir, fs, gate_ms=None,
         mask = (freqs >= f_low) & (freqs < f_high)
         if mask.sum() > 0:
             power = 10.0 ** (magnitude[mask] / 10.0)
-            levels[int(b)] = float(10.0 * np.log10(np.mean(power)))
+            levels[int(b)] = float(
+                10.0 * np.log10(np.mean(power)))
         else:
             levels[int(b)] = np.nan
     return levels, gate_ms_used
@@ -550,12 +606,17 @@ def reverberant_spectrum_third_octave(ir, fs,
                                        bands=THIRD_OCTAVE_CENTRES):
     """
     Return the Schroeder initial decay level for each 1/3-octave
-    band. Uses frequency-scaled truncation margin.
+    band. Uses frequency-scaled filter order and truncation margin.
+
+    Filter order is reduced to 2 below 80 Hz to prevent sosfiltfilt
+    ringing on narrow-bandwidth IRs at low frequencies.
     """
     result = {}
     for b in bands:
         f_low, f_high = third_octave_band_limits(b)
-        ir_band = bandpass_ir(ir, fs, f_low, f_high)
+        order = 2 if b <= 80 else 4
+        ir_band = bandpass_ir(
+            ir, fs, f_low, f_high, order=order)
         direct_idx = detect_direct_arrival(
             ir_band, fs, threshold_db=-20)
         ir_band = ir_band[direct_idx:]
@@ -739,8 +800,7 @@ def smooth_third_octave(levels_dict, fraction=3):
 
     fraction=3 gives 1/3-octave smoothing.
     fraction=6 gives 1/6-octave smoothing (used above transition
-    frequency per Section 5.5 of the white paper — psychoacoustically
-    appropriate for direct sound).
+    frequency per Section 5.5 of the white paper).
 
     Averaging is performed in the power domain.
     Returns smoothed dict with same keys.
@@ -799,15 +859,11 @@ def predict_post_eq_steady_state_third_octave(
     interp_corr = np.interp(log_third, log_oct, oct_corr,
                              left=oct_corr[0], right=oct_corr[-1])
 
-    # 1/6-octave smoothing above transition (direct sound)
     direct_smoothed_hf = smooth_third_octave(
         direct_levels_3rd, fraction=6)
-
-    # 1/3-octave smoothing below transition (spatial average)
     direct_smoothed_lf = smooth_third_octave(
         direct_levels_3rd, fraction=3)
 
-    # Half-octave splice boundaries
     splice_lo = transition_hz / (2.0 ** (1.0 / 2.0))
     splice_hi = transition_hz * (2.0 ** (1.0 / 2.0))
 
@@ -866,24 +922,17 @@ def predict_steady_state_from_physics(
     Predict the steady-state response from physical parameters
     per Section 4.2 of the white paper.
 
-    This is an independent prediction that does not depend on the
-    EQ corrections. It uses:
-      - The measured direct field (captures loudspeaker directivity
-        implicitly)
-      - The measured reverberant field
-      - Air absorption for the throw distance
-
-    The prediction is used as a verification envelope. If the
-    measured steady-state falls within ±2 dB (100 Hz to 8 kHz)
-    or ±3 dB at the extremes the system is behaving correctly.
-    Disagreement localises installation faults.
+    Uses the measured direct and reverberant fields with air
+    absorption for the throw distance. The prediction is used
+    as a verification envelope — if the measured steady-state
+    falls within ±2 dB (100 Hz to 8 kHz) or ±3 dB at the
+    extremes the system is behaving correctly.
 
     Returns:
       predicted dict {centre_hz: level_db}
       tolerance_upper dict {centre_hz: level_db}
       tolerance_lower dict {centre_hz: level_db}
     """
-    # Interpolate octave band RT60 to 1/3-octave resolution
     oct_bands_with_rt60 = sorted(
         b for b in [int(x) for x in OCTAVE_CENTRES]
         if rt60_per_band.get(b) is not None)
@@ -900,7 +949,6 @@ def predict_steady_state_from_physics(
                              left=rt60_vals[0],
                              right=rt60_vals[-1])
 
-    # Air absorption at each 1/3-octave band
     air_abs = air_absorption_at_bands(
         bands, throw_m, temperature_c, humidity_rh)
 
@@ -918,15 +966,11 @@ def predict_steady_state_from_physics(
             tolerance_lower[b] = np.nan
             continue
 
-        # Energy sum of direct and reverberant fields
         ss = 10.0 * np.log10(
             10.0 ** (d / 10.0) + 10.0 ** (r / 10.0))
 
         predicted[b] = round(ss, 2)
 
-        # Tolerance band per Section 4.2
-        # ±2 dB from 100 Hz to 8 kHz
-        # ±3 dB at extremes
         tol = 2.0 if 100.0 <= b <= 8000.0 else 3.0
         tolerance_upper[b] = round(ss + tol, 2)
         tolerance_lower[b] = round(ss - tol, 2)
@@ -952,14 +996,6 @@ def compare_measured_to_predicted(
           'within_tolerance': bool,
           'tolerance': float
       }}
-
-    Bands outside tolerance indicate a system fault:
-      HF shortfall with correct gated response:
-        absorption, screen aim, or screen loss issue
-      LF excess:
-        modal problem or boundary gain
-      Broadband offset:
-        level calibration or gain error
     """
     results = {}
     for b in [float(b) for b in bands]:
@@ -1002,10 +1038,12 @@ def xcurve_target(freqs_hz, screen_size='large'):
     Generate the X-curve target level at each frequency.
 
     Standard X-curve (large rooms > 150 m³, SMPTE ST 202M):
-      Flat to 2 kHz, -3 dB/octave above, -3 dB/octave below 63 Hz.
+      Flat to 2 kHz, -3 dB/octave above,
+      -3 dB/octave below 63 Hz.
 
     Modified X-curve (small rooms < 150 m³, SMPTE RP 200):
-      Flat to 4 kHz, -3 dB/octave above, -3 dB/octave below 63 Hz.
+      Flat to 4 kHz, -3 dB/octave above,
+      -3 dB/octave below 63 Hz.
 
     Returns array of target levels in dB.
     """
