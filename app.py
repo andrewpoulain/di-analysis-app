@@ -111,12 +111,10 @@ xcurve_size = st.sidebar.radio(
         "Small: modified X-curve for rooms < 150 m³ "
         "(SMPTE RP 200), flat region extended to 4 kHz."))
 
-xcurve_ref_band = st.sidebar.number_input(
-    "X-curve reference frequency (Hz)",
-    min_value=500, max_value=2000, value=1000, step=100,
-    help=(
-        "The X-curve will be aligned to the measured direct "
-        "field level at this frequency."))
+# X-curve is always anchored to the measured direct field
+# level at 1 kHz for export. This is the correct reference
+# for all normal use cases.
+XCURVE_REF_HZ = 1000
 
 # ---------------------------------------------------------------------------
 # File upload
@@ -273,11 +271,12 @@ if uploaded_files and st.button("Run Analysis"):
             bands=THIRD_OCTAVE_CENTRES,
             screen_size=xcurve_size)
 
+        # Anchor X-curve export to measured direct field at 1 kHz
         third_oct_sorted = sorted(direct_levels_3rd.keys())
         direct_vals_sorted = [
             direct_levels_3rd[b] for b in third_oct_sorted]
         ref_direct_level = float(np.interp(
-            np.log10(float(xcurve_ref_band)),
+            np.log10(float(XCURVE_REF_HZ)),
             np.log10(third_oct_sorted),
             direct_vals_sorted))
 
@@ -294,8 +293,6 @@ if uploaded_files and st.button("Run Analysis"):
         eq_target_path = (
             out_dir / f"{channel_name}_eq_target.txt")
 
-        # EQ target export uses the room curve normalised values
-        # anchored to the measured direct field level at 1 kHz
         after_3rd = predict_post_eq_steady_state_third_octave(
             direct_levels_3rd,
             reverb_levels_3rd,
@@ -564,7 +561,7 @@ if uploaded_files and st.button("Run Analysis"):
                 help=(
                     "SMPTE ST 202M / ISO 2969 X-curve aligned "
                     "to the measured direct field level at "
-                    f"{xcurve_ref_band} Hz."))
+                    "1 kHz."))
 
     csv_path = out_dir / f"{channel_name}_results.csv"
     if csv_path.exists():
