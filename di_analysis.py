@@ -57,64 +57,6 @@ def third_octave_band_limits(centre_hz):
 
 
 # ---------------------------------------------------------------------------
-# Air absorption (ISO 9613-1)
-# ---------------------------------------------------------------------------
-
-def air_absorption_db_per_metre(frequency_hz,
-                                 temperature_c=20.0,
-                                 humidity_rh=50.0):
-    """
-    Calculate air absorption coefficient in dB/metre at a given
-    frequency, temperature, and relative humidity.
-
-    Based on ISO 9613-1:1993 simplified model valid for:
-      Temperature: 0 to 40 degrees C
-      Humidity:    10 to 90 percent RH
-      Frequency:   50 Hz to 20 kHz
-
-    Returns absorption in dB/metre.
-    """
-    T = temperature_c + 273.15
-    T0 = 293.15
-    T01 = 273.16
-
-    psat = 10.0 ** (-6.8346 * (T01 / T) ** 1.261 + 4.6151)
-    h = humidity_rh * psat
-
-    frO = (24.0 + 4.04e4 * h * (0.02 + h) / (0.391 + h))
-    frN = ((T / T0) ** (-0.5) * (
-        9.0 + 280.0 * h *
-        np.exp(-4.170 * ((T / T0) ** (-1.0 / 3.0) - 1.0))))
-
-    f = float(frequency_hz)
-
-    alpha = 8.686 * f ** 2 * (
-        1.84e-11 * (T / T0) ** 0.5
-        + (T / T0) ** (-2.5) * (
-            0.01275 * np.exp(-2239.1 / T) /
-            (frO + f ** 2 / frO)
-            + 0.1068 * np.exp(-3352.0 / T) /
-            (frN + f ** 2 / frN)))
-
-    return float(alpha)
-
-
-def air_absorption_at_bands(bands, throw_m,
-                             temperature_c=20.0,
-                             humidity_rh=50.0):
-    """
-    Calculate air absorption loss in dB at each band centre
-    frequency. Returns dict {centre_hz: absorption_db}.
-    Absorption values are positive (represent a loss).
-    """
-    return {
-        float(b): float(
-            air_absorption_db_per_metre(
-                b, temperature_c, humidity_rh) * throw_m)
-        for b in bands}
-
-
-# ---------------------------------------------------------------------------
 # Truncation margin scaled by frequency
 # ---------------------------------------------------------------------------
 
@@ -437,7 +379,7 @@ def rt60_from_schroeder(ir, fs, centre_hz):
 # HF RT60 fallback logic
 # ---------------------------------------------------------------------------
 
-def apply_rt60_hf_fallback(rt60_dict, bands=OCTAVE_CENTRES):
+def apply_rt60_hf_fallback(rt60_dict):
     """
     Apply high-frequency RT60 fallback logic.
 
@@ -487,10 +429,9 @@ def apply_rt60_hf_fallback(rt60_dict, bands=OCTAVE_CENTRES):
                 f'at 8 kHz and 16 kHz')
             corrected[8000] = rt60_4k
             corrected[16000] = rt60_4k
-            # Both HF bands corrected — skip Rule 2
             return corrected, warnings
 
-    # Rule 2 — check 16 kHz against (possibly corrected) 8 kHz
+    # Rule 2 — check 16 kHz against 8 kHz
     rt60_8k_current = corrected.get(8000)
     rt60_16k_current = corrected.get(16000)
 
@@ -537,12 +478,7 @@ def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
     averaged = {b: float(np.mean(v)) if v else None
                 for b, v in rt60_all.items()}
 
-    # Apply HF fallback to correct implausible drops
     corrected, hf_warnings = apply_rt60_hf_fallback(averaged)
-
-    # Store warnings on the dict for retrieval by validate_rt60
-    # and the app. The string key is ignored by all integer-keyed
-    # lookups elsewhere in the codebase.
     corrected['_hf_warnings'] = hf_warnings
 
     return corrected
@@ -564,7 +500,6 @@ def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
     warnings = {}
     bands_int = [int(b) for b in bands]
 
-    # Retrieve HF fallback warnings stored on the dict
     hf_warnings = rt60_per_band.get('_hf_warnings', [])
     for i, w in enumerate(hf_warnings):
         warnings[f'hf_fallback_{i}'] = w
@@ -1024,19 +959,16 @@ def predict_steady_state_from_physics(
         rt60_per_band,
         volume_m3,
         surface_area_m2,
-        throw_m,
-        temperature_c=20.0,
-        humidity_rh=50.0,
         bands=THIRD_OCTAVE_CENTRES):
     """
     Predict the steady-state response from physical parameters
     per Section 4.2 of the white paper.
 
-    Uses the measured direct and reverberant fields with air
-    absorption for the throw distance. The prediction is used
-    as a verification envelope — if the measured steady-state
-    falls within ±2 dB (100 Hz to 8 kHz) or ±3 dB at the
-    extremes the system is behaving correctly.
+    Energy-sums the measured direct and reverberant fields to
+    produce the expected steady-state. Used as a verification
+    envelope — if the measured steady-state falls within ±2 dB
+    (100 Hz to 8 kHz) or ±3 dB at the extremes the system is
+    behaving correctly. Disagreement localises installation faults.
 
     Returns:
       predicted dict {centre_hz: level_db}
@@ -1051,22 +983,13 @@ def predict_steady_state_from_physics(
         empty = {float(b): np.nan for b in bands}
         return empty, empty, empty
 
-    rt60_vals = [rt60_per_band[b] for b in oct_bands_with_rt60]
     band_floats = [float(b) for b in bands]
-    log_oct = np.log10([float(b) for b in oct_bands_with_rt60])
-    log_third = np.log10(band_floats)
-    rt60_interp = np.interp(log_third, log_oct, rt60_vals,
-                             left=rt60_vals[0],
-                             right=rt60_vals[-1])
-
-    air_abs = air_absorption_at_bands(
-        bands, throw_m, temperature_c, humidity_rh)
 
     predicted = {}
     tolerance_upper = {}
     tolerance_lower = {}
 
-    for i, b in enumerate(band_floats):
+    for b in band_floats:
         d = direct_levels_3rd.get(b, np.nan)
         r = reverberant_levels_3rd.get(b, np.nan)
 
