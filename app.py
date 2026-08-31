@@ -244,9 +244,9 @@ if uploaded_files and st.button("Run Analysis"):
         reverb_levels_3rd = \
             spatial_average_reverberant_third_octave(irs, ref_fs)
 
-        # Predicted steady-state BEFORE EQ
+        # Predicted room curve — energy sum with no EQ applied
         zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
-        predicted_before_3rd = \
+        predicted_room_curve_3rd = \
             predict_post_eq_steady_state_third_octave(
                 direct_levels_3rd,
                 reverb_levels_3rd,
@@ -254,7 +254,7 @@ if uploaded_files and st.button("Run Analysis"):
                 transition_hz=transition_hz,
                 half_octave_overlap=True)
 
-        # Predicted steady-state AFTER EQ
+        # Predicted steady-state after EQ corrections applied
         predicted_after_3rd = \
             predict_post_eq_steady_state_third_octave(
                 direct_levels_3rd,
@@ -274,7 +274,7 @@ if uploaded_files and st.button("Run Analysis"):
 
         # Verification comparison
         verification_results = compare_measured_to_predicted(
-            predicted_before_3rd,
+            predicted_room_curve_3rd,
             physics_predicted_3rd,
             tol_upper_3rd,
             tol_lower_3rd)
@@ -303,7 +303,7 @@ if uploaded_files and st.button("Run Analysis"):
 
         direct_3rd_norm = norm(direct_levels_3rd)
         reverb_3rd_norm = norm(reverb_levels_3rd)
-        before_3rd_norm = norm(predicted_before_3rd)
+        room_curve_norm = norm(predicted_room_curve_3rd)
         after_3rd_norm = norm(predicted_after_3rd)
         physics_3rd_norm = norm(physics_predicted_3rd)
         tol_upper_norm = norm(tol_upper_3rd)
@@ -388,13 +388,13 @@ if uploaded_files and st.button("Run Analysis"):
     # Main response plot
     # ---------------------------------------------------------------
 
-    st.header("2. Measured Response and Target")
+    st.header("2. Measured Response and Predicted Room Curve")
 
     fig_main = go.Figure()
 
     fig_main.add_trace(make_trace(
         direct_3rd_norm,
-        'Direct field (1/3 oct)',
+        'Direct field (gated, 1/3 oct)',
         'steelblue',
         width=2))
 
@@ -407,30 +407,18 @@ if uploaded_files and st.button("Run Analysis"):
         opacity=0.7))
 
     fig_main.add_trace(make_trace(
-        before_3rd_norm,
-        'Predicted steady-state before EQ',
+        room_curve_norm,
+        'Predicted room curve (direct + reverberant, no EQ)',
         'grey',
-        dash='dot',
-        width=1.5,
-        opacity=0.8))
+        dash='solid',
+        width=2,
+        opacity=0.9))
 
     fig_main.add_trace(make_trace(
         after_3rd_norm,
-        'Predicted steady-state after EQ',
+        'Predicted room curve after EQ',
         'darkorange',
         width=2))
-
-    flat_target = {
-        float(b): 0.0
-        for b in THIRD_OCTAVE_CENTRES
-        if float(b) >= 63}
-    fig_main.add_trace(make_trace(
-        flat_target,
-        'Flat target',
-        'green',
-        dash='dot',
-        width=1.5,
-        opacity=0.6))
 
     if show_physics_prediction and physics_3rd_norm:
         fig_main.add_trace(make_trace(
@@ -474,7 +462,7 @@ if uploaded_files and st.button("Run Analysis"):
     fig_main.update_layout(
         title=(
             f"{channel_name} — {room_name} — "
-            f"Measured Response and Target "
+            f"Measured Response and Predicted Room Curve "
             f"(1/3 octave bands)"),
         xaxis=dict(
             title='Frequency (Hz)',
@@ -499,6 +487,21 @@ if uploaded_files and st.button("Run Analysis"):
         hovermode='x unified')
 
     st.plotly_chart(fig_main, width='stretch')
+
+    st.caption(
+        "**Direct field** — gated IR at reference position, "
+        "1/6-octave smoothed above transition frequency. "
+        "This is what the loudspeaker produces before the "
+        "room acts on it. "
+        "**Reverberant field** — spatially averaged Schroeder "
+        "decay across all measurement positions. "
+        "**Predicted room curve** — energy sum of direct and "
+        "reverberant fields with no EQ applied. "
+        "This is what a steady-state pink noise measurement "
+        "would show. "
+        "**Predicted room curve after EQ** — energy sum after "
+        "the derived octave band corrections are applied. "
+        "All traces normalised to 0 dB at 1 kHz.")
 
     if show_xcurve:
         st.caption(
@@ -721,7 +724,7 @@ if uploaded_files and st.button("Run Analysis"):
                 file_name=eq_target_path.name,
                 mime="text/plain",
                 help=(
-                    "Predicted steady-state response after EQ. "
+                    "Predicted room curve after EQ applied. "
                     "Use as a reference curve in Smaart to "
                     "guide equalisation."))
 
