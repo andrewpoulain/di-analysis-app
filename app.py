@@ -26,7 +26,6 @@ from di_analysis import (
     predict_post_eq_steady_state_third_octave,
     predict_steady_state_from_physics,
     compare_measured_to_predicted,
-    air_absorption_at_bands,
     smooth_third_octave,
     save_csv,
     xcurve_at_third_octave_bands,
@@ -73,26 +72,6 @@ surface = 2.0 * (
 st.sidebar.metric("Volume (m³)", f"{volume:.1f}")
 st.sidebar.metric("Surface area (m²)", f"{surface:.1f}")
 
-st.sidebar.subheader("Room Acoustics")
-
-throw_m = st.sidebar.number_input(
-    "Throw distance (m)",
-    min_value=1.0, max_value=50.0, value=10.0, step=0.5,
-    help=(
-        "Distance from loudspeaker to reference microphone "
-        "position. Used for air absorption correction and "
-        "steady-state prediction."))
-
-temperature_c = st.sidebar.number_input(
-    "Air temperature (°C)",
-    min_value=10.0, max_value=35.0, value=20.0, step=1.0,
-    help="Used for ISO 9613-1 air absorption calculation.")
-
-humidity_rh = st.sidebar.number_input(
-    "Relative humidity (%)",
-    min_value=10.0, max_value=90.0, value=50.0, step=5.0,
-    help="Used for ISO 9613-1 air absorption calculation.")
-
 st.sidebar.subheader("Measurement Settings")
 
 st.sidebar.info(
@@ -104,6 +83,7 @@ st.sidebar.header("Channel Configuration")
 
 channel_name = st.sidebar.text_input(
     "Channel name", value="Left")
+
 gate_ms_input = st.sidebar.number_input(
     "Gate length ms (0 = auto)",
     min_value=0.0, max_value=100.0, value=0.0, step=0.5)
@@ -123,8 +103,8 @@ show_physics_prediction = st.sidebar.checkbox(
     value=True,
     help=(
         "Predicts the expected steady-state response from "
-        "RT60, room geometry, throw distance, and air "
-        "absorption. Use as a verification envelope."))
+        "the measured direct and reverberant fields. "
+        "Use as a verification envelope."))
 
 show_tolerance_band = st.sidebar.checkbox(
     "Show tolerance band",
@@ -264,22 +244,6 @@ if uploaded_files and st.button("Run Analysis"):
         reverb_levels_3rd = \
             spatial_average_reverberant_third_octave(irs, ref_fs)
 
-        # Air absorption
-        air_abs_3rd = air_absorption_at_bands(
-            THIRD_OCTAVE_CENTRES,
-            throw_m=throw_m,
-            temperature_c=temperature_c,
-            humidity_rh=humidity_rh)
-
-        air_abs_1k = air_abs_3rd.get(1000.0, 0.0)
-        air_abs_8k = air_abs_3rd.get(8000.0, 0.0)
-        air_abs_16k = air_abs_3rd.get(16000.0, 0.0)
-        st.info(
-            f"Air absorption at {throw_m:.0f} m — "
-            f"1 kHz: {air_abs_1k:.2f} dB, "
-            f"8 kHz: {air_abs_8k:.2f} dB, "
-            f"16 kHz: {air_abs_16k:.2f} dB")
-
         # Predicted steady-state BEFORE EQ
         zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
         predicted_before_3rd = \
@@ -306,10 +270,7 @@ if uploaded_files and st.button("Run Analysis"):
                 reverb_levels_3rd,
                 rt60_bands,
                 volume_m3=volume,
-                surface_area_m2=surface,
-                throw_m=throw_m,
-                temperature_c=temperature_c,
-                humidity_rh=humidity_rh)
+                surface_area_m2=surface)
 
         # Verification comparison
         verification_results = compare_measured_to_predicted(
@@ -335,9 +296,10 @@ if uploaded_files and st.button("Run Analysis"):
                 ref_level_3rd = 0.0
 
         def norm(d):
-            return {b: v - ref_level_3rd
-                    for b, v in d.items()
-                    if not np.isnan(v)}
+            return {
+                b: v - ref_level_3rd
+                for b, v in d.items()
+                if not np.isnan(v)}
 
         direct_3rd_norm = norm(direct_levels_3rd)
         reverb_3rd_norm = norm(reverb_levels_3rd)
@@ -399,7 +361,7 @@ if uploaded_files and st.button("Run Analysis"):
     if rt60_warnings:
         st.warning("RT60 validation warnings:")
         for band, msg in rt60_warnings.items():
-            st.write(f"  **{band} Hz:** {msg}")
+            st.write(f"  **{band}:** {msg}")
 
     # ---------------------------------------------------------------
     # Helper: build Plotly trace
@@ -408,8 +370,9 @@ if uploaded_files and st.button("Run Analysis"):
     def make_trace(levels_dict, name, colour,
                    dash='solid', width=2, opacity=1.0):
         if not levels_dict:
-            return go.Scatter(x=[], y=[], name=name,
-                              line=dict(color=colour))
+            return go.Scatter(
+                x=[], y=[], name=name,
+                line=dict(color=colour))
         bands_sorted = sorted(levels_dict.keys())
         x = [float(b) for b in bands_sorted]
         y = [float(levels_dict[b]) for b in bands_sorted]
@@ -432,40 +395,55 @@ if uploaded_files and st.button("Run Analysis"):
     fig_main.add_trace(make_trace(
         direct_3rd_norm,
         'Direct field (1/3 oct)',
-        'steelblue', width=2))
+        'steelblue',
+        width=2))
 
     fig_main.add_trace(make_trace(
         reverb_3rd_norm,
         'Reverberant field (spatially averaged)',
-        'firebrick', dash='dash', width=1.5, opacity=0.7))
+        'firebrick',
+        dash='dash',
+        width=1.5,
+        opacity=0.7))
 
     fig_main.add_trace(make_trace(
         before_3rd_norm,
         'Predicted steady-state before EQ',
-        'grey', dash='dot', width=1.5, opacity=0.8))
+        'grey',
+        dash='dot',
+        width=1.5,
+        opacity=0.8))
 
     fig_main.add_trace(make_trace(
         after_3rd_norm,
         'Predicted steady-state after EQ',
-        'darkorange', width=2))
+        'darkorange',
+        width=2))
 
     flat_target = {
-        float(b): 0.0 for b in THIRD_OCTAVE_CENTRES
+        float(b): 0.0
+        for b in THIRD_OCTAVE_CENTRES
         if float(b) >= 63}
     fig_main.add_trace(make_trace(
         flat_target,
         'Flat target',
-        'green', dash='dot', width=1.5, opacity=0.6))
+        'green',
+        dash='dot',
+        width=1.5,
+        opacity=0.6))
 
     if show_physics_prediction and physics_3rd_norm:
         fig_main.add_trace(make_trace(
             physics_3rd_norm,
             'Physics-based steady-state prediction',
-            'darkgreen', dash='longdash',
-            width=2, opacity=0.8))
+            'darkgreen',
+            dash='longdash',
+            width=2,
+            opacity=0.8))
 
     if (show_tolerance_band
-            and tol_upper_norm and tol_lower_norm):
+            and tol_upper_norm
+            and tol_lower_norm):
         bands_tol = sorted(tol_upper_norm.keys())
         x_tol = [float(b) for b in bands_tol]
         y_upper = [tol_upper_norm[b] for b in bands_tol]
@@ -489,7 +467,9 @@ if uploaded_files and st.button("Run Analysis"):
         fig_main.add_trace(make_trace(
             xcurve_display,
             xcurve_label,
-            'purple', dash='dashdot', width=2))
+            'purple',
+            dash='dashdot',
+            width=2))
 
     fig_main.update_layout(
         title=(
@@ -568,11 +548,11 @@ if uploaded_files and st.button("Run Analysis"):
         st.header("4. Verification Against Physics Prediction")
 
         st.caption(
-            "The physics-based prediction is derived from the "
-            "measured RT60, room geometry, throw distance, and "
-            "air absorption. The measured steady-state should "
-            "fall within ±2 dB (100 Hz–8 kHz) or ±3 dB "
-            "(below 100 Hz and above 8 kHz). "
+            "The physics-based prediction is the energy sum of "
+            "the measured direct and reverberant fields. "
+            "The measured steady-state should fall within "
+            "±2 dB (100 Hz–8 kHz) or ±3 dB (below 100 Hz "
+            "and above 8 kHz). "
             "Bands outside tolerance indicate a system fault, "
             "not an EQ problem.")
 
@@ -639,24 +619,6 @@ if uploaded_files and st.button("Run Analysis"):
                 "The system is behaving as the physics "
                 "predict.")
 
-        with st.expander("Air absorption detail"):
-            air_rows = []
-            for b in oct_bands_display:
-                nearest = min(
-                    air_abs_3rd.keys(),
-                    key=lambda k: abs(k - b))
-                air_rows.append({
-                    'Band (Hz)': b,
-                    'Absorption (dB)': round(
-                        air_abs_3rd[nearest], 3)})
-            st.dataframe(
-                pd.DataFrame(air_rows), hide_index=True)
-            st.caption(
-                f"Temperature: {temperature_c:.0f} °C, "
-                f"Humidity: {humidity_rh:.0f}% RH, "
-                f"Throw: {throw_m:.1f} m. "
-                "Calculated per ISO 9613-1.")
-
     # ---------------------------------------------------------------
     # RT60 and DI plots
     # ---------------------------------------------------------------
@@ -671,7 +633,8 @@ if uploaded_files and st.button("Run Analysis"):
 
     rt60_bands_sorted = sorted(
         b for b in rt60_bands
-        if rt60_bands[b] is not None)
+        if isinstance(b, int)
+        and rt60_bands[b] is not None)
     rt60_vals = [rt60_bands[b] for b in rt60_bands_sorted]
 
     fig_rt_di.add_trace(
@@ -720,8 +683,9 @@ if uploaded_files and st.button("Run Analysis"):
     with col3:
         st.metric("IR files processed", len(irs))
     with col4:
-        valid_rt60 = [v for v in rt60_bands.values()
-                      if v is not None]
+        valid_rt60 = [
+            v for k, v in rt60_bands.items()
+            if isinstance(k, int) and v is not None]
         avg_rt60 = np.mean(valid_rt60) if valid_rt60 else 0.0
         st.metric("Mean RT60", f"{avg_rt60:.2f} s")
 
