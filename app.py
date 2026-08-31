@@ -112,8 +112,7 @@ xcurve_size = st.sidebar.radio(
         "(SMPTE RP 200), flat region extended to 4 kHz."))
 
 # X-curve is always anchored to the measured direct field
-# level at 1 kHz for export. This is the correct reference
-# for all normal use cases.
+# level at 1 kHz for export.
 XCURVE_REF_HZ = 1000
 
 # ---------------------------------------------------------------------------
@@ -271,7 +270,6 @@ if uploaded_files and st.button("Run Analysis"):
             bands=THIRD_OCTAVE_CENTRES,
             screen_size=xcurve_size)
 
-        # Anchor X-curve export to measured direct field at 1 kHz
         third_oct_sorted = sorted(direct_levels_3rd.keys())
         direct_vals_sorted = [
             direct_levels_3rd[b] for b in third_oct_sorted]
@@ -318,6 +316,43 @@ if uploaded_files and st.button("Run Analysis"):
             output_path=xcurve_export_path,
             screen_size=xcurve_size)
 
+        # Store results in session state so the plot controls
+        # below can redraw without re-running the analysis
+        st.session_state['direct_3rd_norm'] = direct_3rd_norm
+        st.session_state['reverb_3rd_norm'] = reverb_3rd_norm
+        st.session_state['room_curve_norm'] = room_curve_norm
+        st.session_state['xcurve_display'] = xcurve_display
+        st.session_state['rt60_bands'] = rt60_bands
+        st.session_state['rt60_warnings'] = rt60_warnings
+        st.session_state['di'] = di
+        st.session_state['gate_ms_used'] = gate_ms_used
+        st.session_state['transition_hz'] = transition_hz
+        st.session_state['df'] = df
+        st.session_state['eq_target_path'] = eq_target_path
+        st.session_state['xcurve_export_path'] = \
+            xcurve_export_path
+        st.session_state['analysis_complete'] = True
+
+# ---------------------------------------------------------------------------
+# Display — runs whenever session state is populated, including
+# after the sliders below are adjusted without re-running analysis
+# ---------------------------------------------------------------------------
+
+if st.session_state.get('analysis_complete'):
+
+    direct_3rd_norm = st.session_state['direct_3rd_norm']
+    reverb_3rd_norm = st.session_state['reverb_3rd_norm']
+    room_curve_norm = st.session_state['room_curve_norm']
+    xcurve_display = st.session_state['xcurve_display']
+    rt60_bands = st.session_state['rt60_bands']
+    rt60_warnings = st.session_state['rt60_warnings']
+    di = st.session_state['di']
+    gate_ms_used = st.session_state['gate_ms_used']
+    transition_hz = st.session_state['transition_hz']
+    df = st.session_state['df']
+    eq_target_path = st.session_state['eq_target_path']
+    xcurve_export_path = st.session_state['xcurve_export_path']
+
     # ---------------------------------------------------------------
     # RT60 warnings
     # ---------------------------------------------------------------
@@ -354,25 +389,82 @@ if uploaded_files and st.button("Run Analysis"):
 
     st.header("2. Measured Response and Predicted Room Curve")
 
+    # Trace offset controls — placed directly above the chart
+    # so the engineer can adjust without scrolling to the sidebar
+    with st.expander("Trace level offsets", expanded=False):
+        st.caption(
+            "Shift individual traces up or down to align "
+            "with an external reference or to compare "
+            "channels measured at different gain settings. "
+            "Offsets are display-only and do not affect "
+            "the EQ corrections or exported files.")
+
+        col_a, col_b, col_c = st.columns(3)
+
+        with col_a:
+            direct_offset = st.slider(
+                "Direct field offset (dB)",
+                min_value=-20.0,
+                max_value=20.0,
+                value=0.0,
+                step=0.5,
+                key='direct_offset')
+
+        with col_b:
+            reverb_offset = st.slider(
+                "Reverberant field offset (dB)",
+                min_value=-20.0,
+                max_value=20.0,
+                value=0.0,
+                step=0.5,
+                key='reverb_offset')
+
+        with col_c:
+            room_curve_offset = st.slider(
+                "Predicted room curve offset (dB)",
+                min_value=-20.0,
+                max_value=20.0,
+                value=0.0,
+                step=0.5,
+                key='room_curve_offset')
+
+    # Apply offsets to display copies — originals in session
+    # state are unchanged so exports are not affected
+    direct_display = {
+        b: v + direct_offset
+        for b, v in direct_3rd_norm.items()}
+    reverb_display = {
+        b: v + reverb_offset
+        for b, v in reverb_3rd_norm.items()}
+    room_curve_display = {
+        b: v + room_curve_offset
+        for b, v in room_curve_norm.items()}
+
     fig_main = go.Figure()
 
     fig_main.add_trace(make_trace(
-        direct_3rd_norm,
-        'Direct field (gated, 1/3 oct)',
+        direct_display,
+        'Direct field (gated, 1/3 oct)'
+        + (f'  {direct_offset:+.1f} dB'
+           if direct_offset != 0.0 else ''),
         'steelblue',
         width=2))
 
     fig_main.add_trace(make_trace(
-        reverb_3rd_norm,
-        'Reverberant field (spatially averaged)',
+        reverb_display,
+        'Reverberant field (spatially averaged)'
+        + (f'  {reverb_offset:+.1f} dB'
+           if reverb_offset != 0.0 else ''),
         'firebrick',
         dash='dash',
         width=1.5,
         opacity=0.7))
 
     fig_main.add_trace(make_trace(
-        room_curve_norm,
-        'Predicted room curve (direct + reverberant, no EQ)',
+        room_curve_display,
+        'Predicted room curve (direct + reverberant, no EQ)'
+        + (f'  {room_curve_offset:+.1f} dB'
+           if room_curve_offset != 0.0 else ''),
         'grey',
         dash='solid',
         width=2,
@@ -430,7 +522,9 @@ if uploaded_files and st.button("Run Analysis"):
         "reverberant fields with no EQ applied. "
         "This is what a steady-state pink noise measurement "
         "would show. "
-        "All traces normalised to 0 dB at 1 kHz.")
+        "All traces normalised to 0 dB at 1 kHz. "
+        "Offsets applied via the controls above are "
+        "display-only.")
 
     if show_xcurve:
         st.caption(
@@ -504,7 +598,9 @@ if uploaded_files and st.button("Run Analysis"):
         st.metric("Transition frequency",
                   f"{transition_hz} Hz")
     with col3:
-        st.metric("IR files processed", len(irs))
+        st.metric(
+            "IR files processed",
+            len(st.session_state.get('direct_3rd_norm', {})))
     with col4:
         valid_rt60 = [
             v for k, v in rt60_bands.items()
@@ -536,34 +632,35 @@ if uploaded_files and st.button("Run Analysis"):
 
     col1, col2, col3 = st.columns(3)
 
-    if eq_target_path.exists():
+    if Path(eq_target_path).exists():
         with col1:
             st.download_button(
                 label="EQ target curve (Smaart)",
-                data=eq_target_path.read_bytes(),
-                file_name=eq_target_path.name,
+                data=Path(eq_target_path).read_bytes(),
+                file_name=Path(eq_target_path).name,
                 mime="text/plain",
                 help=(
                     "Predicted room curve after EQ applied. "
                     "Use as a reference curve in Smaart to "
                     "guide equalisation."))
 
-    if xcurve_export_path.exists():
+    if Path(xcurve_export_path).exists():
         with col2:
             st.download_button(
                 label=(
                     f"X-curve "
                     f"({'large' if xcurve_size == 'large' else 'small'}"
                     f" room, Smaart)"),
-                data=xcurve_export_path.read_bytes(),
-                file_name=xcurve_export_path.name,
+                data=Path(xcurve_export_path).read_bytes(),
+                file_name=Path(xcurve_export_path).name,
                 mime="text/plain",
                 help=(
                     "SMPTE ST 202M / ISO 2969 X-curve aligned "
                     "to the measured direct field level at "
                     "1 kHz."))
 
-    csv_path = out_dir / f"{channel_name}_results.csv"
+    csv_path = Path(eq_target_path).parent / \
+        f"{channel_name}_results.csv"
     if csv_path.exists():
         with col3:
             st.download_button(
@@ -575,5 +672,3 @@ if uploaded_files and st.button("Run Analysis"):
                     "Full per-band results including direct "
                     "field, reverberant field, RT60, DI, and "
                     "EQ corrections."))
-
-    shutil.rmtree(tmp_dir)
