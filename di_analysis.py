@@ -343,8 +343,7 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     Evaluation order is frequency-dependent:
 
       Below 8 kHz:
-        T20 (-5 to -25 dB) primary — most robust for
-        noise-excited TF-derived IRs from Smaart
+        T20 (-5 to -25 dB) primary
         T30 (-5 to -35 dB) first fallback
         EDT (0 to -10 dB) last resort
 
@@ -368,9 +367,6 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     Returns RT60 in seconds, or None if unreliable.
     """
     f_low, f_high = octave_band_limits(centre_hz)
-
-    # Reduce filter order at low frequencies to prevent
-    # sosfiltfilt ringing on narrow-bandwidth short IRs
     order = 2 if centre_hz <= 63 else 4
 
     nyq = fs / 2.0
@@ -403,16 +399,12 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
 
-    # Frequency-dependent evaluation order and slope threshold
     if centre_hz >= 8000:
-        # EDT primary at HF — insufficient dynamic range for T20
         eval_ranges = [
             (0,   -10),   # EDT — primary at HF
             (-5,  -25),   # T20 — fallback
             (-5,  -35),   # T30 — last resort
         ]
-        # Relax minimum slope threshold at HF
-        # Short decays have steeper slopes
         min_slope = -0.1
     else:
         eval_ranges = [
@@ -441,13 +433,142 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     return None
 
 
+# ---------------------------------------------------------------------------
+# HF RT60 fallback logic
+# ---------------------------------------------------------------------------
+
+def apply_rt60_hf_fallback(rt60_dict, bands=OCTAVE_CENTRES):
+    """
+    Apply high-frequency RT60 fallback logic.
+
+    At high frequencies the IR dynamic range is often insufficient
+    to produce a reliable RT60 estimate. This function detects
+    implausible drops in RT60 at 8 kHz and 16 kHz and substitutes
+    the value from the next lower band.
+
+    Rules applied in order:
+
+    Rule 1 — 8 kHz check:
+      If RT60 at 8 kHz < 10% of RT60 at 4 kHz,
+      replace 8 kHz RT60 with the 4 kHz value.
+      Also replace 16 kHz with the 4 kHz value.
+      Rule 2 is then skipped since both bands are set.
+
+    Rule 2 — 16 kHz check (only if Rule 1 did not trigger):
+      If RT60 at 16 kHz < 10% of RT60 at 8 kHz,
+      replace 16 kHz RT60 with the 8 kHz value.
+
+    The 10% threshold is chosen because a genuine room cannot
+    lose 90% of its reverberation time in a single octave step.
+    The largest physically plausible single-octave drop in a
+    well-behaved room is roughly 40-50%. A drop to less than
+    10% of the previous band is a measurement failure, not a
+    room property.
+
+    Returns a new dict with corrected values and a list of
+    warning strings describing any substitutions made.
+    """
+    corrected = dict(rt60_dict)
+    warnings = []
+
+    rt60_4k = corrected.get(4000)
+    rt60_8k = corrected.get(8000)
+
+    # Rule 1 — check 8 kHz against 4 kHz
+    if (rt60_4k is not None
+            and rt60_8k is not None
+            and rt60_4k > 0):
+        ratio_8k = rt60_8k / rt60_4k
+        if ratio_8k < 0.10:
+            warnings.append(
+                f'8 kHz RT60 ({rt60_8k:.3f} s) is less than '
+                f'10% of 4 kHz RT60 ({rt60_4k:.3f} s) — '
+                f'substituting 4 kHz value ({rt60_4k:.3f} s) '
+                f'at 8 kHz and 16 kHz')
+            corrected[8000] = rt60_4k
+            corrected[16000] = rt60_4k
+            # Both HF bands corrected — skip Rule 2
+            return corrected, warnings
+
+    # Rule 2 — check 16 kHz against (possibly corrected) 8 kHz
+    rt60_8k_current = corrected.get(8000)
+    rt60_16k_current = corrected.get(16000)
+
+    if (rt60_8k_current is not None
+            and rt60_16k_current is not None
+            and rt60_8k_current > 0):
+        ratio_16k = rt60_16k_current / rt60_8k_current
+        if ratio_16k < 0.10:
+            warnings.append(
+                f'16 kHz RT60 ({rt60_16k_current:.3f} s) is '
+                f'less than 10% of 8 kHz RT60 '
+                f'({rt60_8k_current:.3f} s) — '
+                f'substituting 8 kHz value '
+                f'({rt60_8k_current:.3f} s) at 16 kHz')
+            corrected[16000] = rt60_8k_current
+
+    return corrected, warnings
+
+
+# ---------------------------------------------------------------------------
+# RT60 averaging across positions
+# ---------------------------------------------------------------------------
+
+def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
+    """
+    Estimate RT60 per octave band by averaging across all IR
+    positions.
+
+    After averaging, applies HF fallback logic to correct
+    implausible drops at 8 kHz and 16 kHz. Any substitutions
+    made are stored in the returned dict under the key
+    '_hf_warnings' as a list of strings.
+
+    Returns dict {centre_hz: RT60_seconds} with an additional
+    '_hf_warnings' key containing a list of warning strings.
+    """
+    rt60_all = {int(b): [] for b in bands}
+    for ir in ir_list:
+        for b in bands:
+            rt = rt60_from_schroeder(ir, fs, b)
+            if rt is not None:
+                rt60_all[int(b)].append(rt)
+
+    averaged = {b: float(np.mean(v)) if v else None
+                for b, v in rt60_all.items()}
+
+    # Apply HF fallback to correct implausible drops
+    corrected, hf_warnings = apply_rt60_hf_fallback(averaged)
+
+    # Store warnings on the dict for retrieval by validate_rt60
+    # and the app. The string key is ignored by all integer-keyed
+    # lookups elsewhere in the codebase.
+    corrected['_hf_warnings'] = hf_warnings
+
+    return corrected
+
+
+# ---------------------------------------------------------------------------
+# RT60 validation
+# ---------------------------------------------------------------------------
+
 def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
     """
     Check RT60 values for physical plausibility.
     Returns a dict of warnings keyed by band.
+
+    Includes any HF fallback substitution warnings from
+    apply_rt60_hf_fallback that were stored on the dict by
+    rt60_per_band_from_irs.
     """
     warnings = {}
     bands_int = [int(b) for b in bands]
+
+    # Retrieve HF fallback warnings stored on the dict
+    hf_warnings = rt60_per_band.get('_hf_warnings', [])
+    for i, w in enumerate(hf_warnings):
+        warnings[f'hf_fallback_{i}'] = w
+
     valid = {b: rt60_per_band.get(b) for b in bands_int
              if rt60_per_band.get(b) is not None}
 
@@ -475,6 +596,10 @@ def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
     return warnings
 
 
+# ---------------------------------------------------------------------------
+# Room constant
+# ---------------------------------------------------------------------------
+
 def room_constant(rt60_s, volume_m3, surface_area_m2):
     """
     Derive the room constant R from RT60 via Sabine inversion.
@@ -485,21 +610,6 @@ def room_constant(rt60_s, volume_m3, surface_area_m2):
     alpha = 0.161 * volume_m3 / (rt60_s * surface_area_m2)
     alpha = min(alpha, 0.999)
     return surface_area_m2 * alpha / (1.0 - alpha)
-
-
-def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
-    """
-    Estimate RT60 per octave band by averaging across all IR
-    positions. Returns dict {centre_hz: RT60_seconds}.
-    """
-    rt60_all = {int(b): [] for b in bands}
-    for ir in ir_list:
-        for b in bands:
-            rt = rt60_from_schroeder(ir, fs, b)
-            if rt is not None:
-                rt60_all[int(b)].append(rt)
-    return {b: float(np.mean(v)) if v else None
-            for b, v in rt60_all.items()}
 
 
 # ---------------------------------------------------------------------------
