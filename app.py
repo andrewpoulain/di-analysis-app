@@ -98,21 +98,6 @@ hf_shelf_db = st.sidebar.number_input(
 
 st.sidebar.header("Display Options")
 
-show_physics_prediction = st.sidebar.checkbox(
-    "Show physics-based prediction",
-    value=True,
-    help=(
-        "Predicts the expected steady-state response from "
-        "the measured direct and reverberant fields. "
-        "Use as a verification envelope."))
-
-show_tolerance_band = st.sidebar.checkbox(
-    "Show tolerance band",
-    value=True,
-    help=(
-        "±2 dB (100 Hz–8 kHz) and ±3 dB at extremes "
-        "per Section 4.2 of the white paper."))
-
 show_xcurve = st.sidebar.checkbox(
     "Show X-curve target", value=False)
 
@@ -254,31 +239,6 @@ if uploaded_files and st.button("Run Analysis"):
                 transition_hz=transition_hz,
                 half_octave_overlap=True)
 
-        # Predicted steady-state after EQ corrections applied
-        predicted_after_3rd = \
-            predict_post_eq_steady_state_third_octave(
-                direct_levels_3rd,
-                reverb_levels_3rd,
-                all_corr,
-                transition_hz=transition_hz,
-                half_octave_overlap=True)
-
-        # Physics-based prediction and tolerance bands
-        physics_predicted_3rd, tol_upper_3rd, tol_lower_3rd = \
-            predict_steady_state_from_physics(
-                direct_levels_3rd,
-                reverb_levels_3rd,
-                rt60_bands,
-                volume_m3=volume,
-                surface_area_m2=surface)
-
-        # Verification comparison
-        verification_results = compare_measured_to_predicted(
-            predicted_room_curve_3rd,
-            physics_predicted_3rd,
-            tol_upper_3rd,
-            tol_lower_3rd)
-
         # -----------------------------------------------------------
         # Reference level and normalisation
         # -----------------------------------------------------------
@@ -304,10 +264,6 @@ if uploaded_files and st.button("Run Analysis"):
         direct_3rd_norm = norm(direct_levels_3rd)
         reverb_3rd_norm = norm(reverb_levels_3rd)
         room_curve_norm = norm(predicted_room_curve_3rd)
-        after_3rd_norm = norm(predicted_after_3rd)
-        physics_3rd_norm = norm(physics_predicted_3rd)
-        tol_upper_norm = norm(tol_upper_3rd)
-        tol_lower_norm = norm(tol_lower_3rd)
 
         # -----------------------------------------------------------
         # X-curve
@@ -337,6 +293,17 @@ if uploaded_files and st.button("Run Analysis"):
 
         eq_target_path = (
             out_dir / f"{channel_name}_eq_target.txt")
+
+        # EQ target export uses the room curve normalised values
+        # anchored to the measured direct field level at 1 kHz
+        after_3rd = predict_post_eq_steady_state_third_octave(
+            direct_levels_3rd,
+            reverb_levels_3rd,
+            all_corr,
+            transition_hz=transition_hz,
+            half_octave_overlap=True)
+        after_3rd_norm = norm(after_3rd)
+
         export_target_for_smaart(
             target_levels_3rd=after_3rd_norm,
             ref_level_db=ref_level_3rd,
@@ -414,39 +381,6 @@ if uploaded_files and st.button("Run Analysis"):
         width=2,
         opacity=0.9))
 
-    fig_main.add_trace(make_trace(
-        after_3rd_norm,
-        'Predicted room curve after EQ',
-        'darkorange',
-        width=2))
-
-    if show_physics_prediction and physics_3rd_norm:
-        fig_main.add_trace(make_trace(
-            physics_3rd_norm,
-            'Physics-based steady-state prediction',
-            'darkgreen',
-            dash='longdash',
-            width=2,
-            opacity=0.8))
-
-    if (show_tolerance_band
-            and tol_upper_norm
-            and tol_lower_norm):
-        bands_tol = sorted(tol_upper_norm.keys())
-        x_tol = [float(b) for b in bands_tol]
-        y_upper = [tol_upper_norm[b] for b in bands_tol]
-        y_lower = [tol_lower_norm.get(b, np.nan)
-                   for b in bands_tol]
-        fig_main.add_trace(go.Scatter(
-            x=x_tol + x_tol[::-1],
-            y=y_upper + y_lower[::-1],
-            fill='toself',
-            fillcolor='rgba(0, 128, 0, 0.08)',
-            line=dict(color='rgba(0,0,0,0)'),
-            name='Tolerance band (±2 dB / ±3 dB)',
-            showlegend=True,
-            hoverinfo='skip'))
-
     if show_xcurve:
         xcurve_label = (
             f'X-curve '
@@ -480,10 +414,10 @@ if uploaded_files and st.button("Run Analysis"):
         legend=dict(
             orientation='h',
             yanchor='bottom',
-            y=-0.45,
+            y=-0.35,
             xanchor='left',
             x=0),
-        height=580,
+        height=560,
         hovermode='x unified')
 
     st.plotly_chart(fig_main, width='stretch')
@@ -499,8 +433,6 @@ if uploaded_files and st.button("Run Analysis"):
         "reverberant fields with no EQ applied. "
         "This is what a steady-state pink noise measurement "
         "would show. "
-        "**Predicted room curve after EQ** — energy sum after "
-        "the derived octave band corrections are applied. "
         "All traces normalised to 0 dB at 1 kHz.")
 
     if show_xcurve:
@@ -514,119 +446,10 @@ if uploaded_files and st.button("Run Analysis"):
                if xcurve_size == "small" else "."))
 
     # ---------------------------------------------------------------
-    # EQ corrections chart
-    # ---------------------------------------------------------------
-
-    st.header("3. Derived EQ Corrections")
-
-    fig_eq = go.Figure()
-
-    bands_sorted = sorted(all_corr.keys())
-    corr_vals = [all_corr[b] for b in bands_sorted]
-    colours = ['tomato' if v < 0 else 'steelblue'
-               for v in corr_vals]
-
-    fig_eq.add_trace(go.Bar(
-        x=[str(b) for b in bands_sorted],
-        y=corr_vals,
-        marker_color=colours,
-        name='EQ correction (dB)'))
-
-    fig_eq.add_hline(
-        y=0, line_dash='dot', line_color='grey')
-
-    fig_eq.update_layout(
-        title='EQ Correction per Octave Band',
-        xaxis_title='Octave band (Hz)',
-        yaxis_title='Correction (dB)',
-        height=350)
-
-    st.plotly_chart(fig_eq, width='stretch')
-
-    # ---------------------------------------------------------------
-    # Verification against physics prediction
-    # ---------------------------------------------------------------
-
-    if show_physics_prediction:
-        st.header("4. Verification Against Physics Prediction")
-
-        st.caption(
-            "The physics-based prediction is the energy sum of "
-            "the measured direct and reverberant fields. "
-            "The measured steady-state should fall within "
-            "±2 dB (100 Hz–8 kHz) or ±3 dB (below 100 Hz "
-            "and above 8 kHz). "
-            "Bands outside tolerance indicate a system fault, "
-            "not an EQ problem.")
-
-        oct_bands_display = [
-            63, 125, 250, 500, 1000,
-            2000, 4000, 8000, 16000]
-        ver_rows = []
-        for b in oct_bands_display:
-            nearest = min(
-                verification_results.keys(),
-                key=lambda k: abs(k - b),
-                default=None)
-            if nearest is None:
-                continue
-            r = verification_results[nearest]
-            within = r['within_tolerance']
-            status = (
-                '✅ Pass' if within is True
-                else '❌ Fail' if within is False
-                else '—')
-            ver_rows.append({
-                'Band (Hz)': b,
-                'Predicted (dB)': r['predicted'],
-                'Delta (dB)': r['delta'],
-                'Tolerance': (
-                    f"±{r['tolerance']:.0f} dB"
-                    if not np.isnan(r['tolerance'])
-                    else '—'),
-                'Status': status})
-
-        if ver_rows:
-            ver_df = pd.DataFrame(ver_rows)
-            st.dataframe(ver_df, hide_index=True)
-
-        fails = [r for r in ver_rows
-                 if r['Status'] == '❌ Fail']
-        if fails:
-            fail_bands = [r['Band (Hz)'] for r in fails]
-            hf_fails = [b for b in fail_bands if b >= 4000]
-            lf_fails = [b for b in fail_bands if b <= 250]
-            mid_fails = [b for b in fail_bands
-                         if 250 < b < 4000]
-            if hf_fails:
-                st.warning(
-                    f"HF shortfall at {hf_fails} Hz — "
-                    "check screen absorption, loudspeaker "
-                    "aim, or screen insertion loss. "
-                    "This is an installation issue, "
-                    "not an EQ issue.")
-            if lf_fails:
-                st.warning(
-                    f"LF deviation at {lf_fails} Hz — "
-                    "check for modal problems or boundary "
-                    "gain. Spatial averaging may need more "
-                    "positions.")
-            if mid_fails:
-                st.warning(
-                    f"Mid-band deviation at {mid_fails} Hz — "
-                    "check level calibration and gain "
-                    "alignment.")
-        else:
-            st.success(
-                "All bands within tolerance. "
-                "The system is behaving as the physics "
-                "predict.")
-
-    # ---------------------------------------------------------------
     # RT60 and DI plots
     # ---------------------------------------------------------------
 
-    st.header("5. RT60 and Directivity Index")
+    st.header("3. RT60 and Directivity Index")
 
     fig_rt_di = make_subplots(
         rows=1, cols=2,
@@ -675,7 +498,7 @@ if uploaded_files and st.button("Run Analysis"):
     # Summary metrics
     # ---------------------------------------------------------------
 
-    st.header("6. Measurement Summary")
+    st.header("4. Measurement Summary")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -696,14 +519,14 @@ if uploaded_files and st.button("Run Analysis"):
     # Results table
     # ---------------------------------------------------------------
 
-    st.header("7. Results Table")
+    st.header("5. Results Table")
     st.dataframe(df)
 
     # ---------------------------------------------------------------
     # Downloads
     # ---------------------------------------------------------------
 
-    st.header("8. Downloads")
+    st.header("6. Downloads")
 
     st.subheader("Smaart Reference Curve Files")
     st.caption(
