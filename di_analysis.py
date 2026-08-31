@@ -391,21 +391,30 @@ def apply_rt60_hf_fallback(rt60_dict):
     Rules applied in order:
 
     Rule 1 — 8 kHz check:
-      If RT60 at 8 kHz < 10% of RT60 at 4 kHz,
+      If RT60 at 8 kHz < 50% of RT60 at 4 kHz,
       replace 8 kHz RT60 with the 4 kHz value.
       Also replace 16 kHz with the 4 kHz value.
       Rule 2 is then skipped since both bands are set.
 
     Rule 2 — 16 kHz check (only if Rule 1 did not trigger):
-      If RT60 at 16 kHz < 10% of RT60 at 8 kHz,
+      If RT60 at 16 kHz < 50% of RT60 at 8 kHz,
       replace 16 kHz RT60 with the 8 kHz value.
 
-    The 10% threshold is chosen because a genuine room cannot
-    lose 90% of its reverberation time in a single octave step.
-    The largest physically plausible single-octave drop in a
-    well-behaved room is roughly 40-50%. A drop to less than
-    10% of the previous band is a measurement failure, not a
-    room property.
+    Threshold rationale:
+      The largest physically plausible single-octave RT60 drop
+      in a well-behaved room is roughly 40-45% (e.g. 0.86 s at
+      4 kHz to 0.47 s at 8 kHz in the reference measurement,
+      ratio = 0.55). A drop beyond 50% of the previous band
+      value indicates a measurement failure rather than a room
+      property and triggers substitution.
+
+      Verified against known datasets:
+        4 kHz: 0.860 s, 8 kHz: 0.470 s
+          ratio = 0.55 — plausible, no substitution
+
+        4 kHz: 0.791 s, 8 kHz: 0.208 s
+          ratio = 0.26 — implausible, substitute 4 kHz value
+          at 8 kHz and 16 kHz
 
     Returns a new dict with corrected values and a list of
     warning strings describing any substitutions made.
@@ -421,11 +430,13 @@ def apply_rt60_hf_fallback(rt60_dict):
             and rt60_8k is not None
             and rt60_4k > 0):
         ratio_8k = rt60_8k / rt60_4k
-        if ratio_8k < 0.10:
+        if ratio_8k < 0.50:
             warnings.append(
-                f'8 kHz RT60 ({rt60_8k:.3f} s) is less than '
-                f'10% of 4 kHz RT60 ({rt60_4k:.3f} s) — '
-                f'substituting 4 kHz value ({rt60_4k:.3f} s) '
+                f'8 kHz RT60 ({rt60_8k * 1000:.0f} ms) is '
+                f'less than 50% of 4 kHz RT60 '
+                f'({rt60_4k * 1000:.0f} ms) — '
+                f'substituting 4 kHz value '
+                f'({rt60_4k * 1000:.0f} ms) '
                 f'at 8 kHz and 16 kHz')
             corrected[8000] = rt60_4k
             corrected[16000] = rt60_4k
@@ -439,13 +450,13 @@ def apply_rt60_hf_fallback(rt60_dict):
             and rt60_16k_current is not None
             and rt60_8k_current > 0):
         ratio_16k = rt60_16k_current / rt60_8k_current
-        if ratio_16k < 0.10:
+        if ratio_16k < 0.50:
             warnings.append(
-                f'16 kHz RT60 ({rt60_16k_current:.3f} s) is '
-                f'less than 10% of 8 kHz RT60 '
-                f'({rt60_8k_current:.3f} s) — '
+                f'16 kHz RT60 ({rt60_16k_current * 1000:.0f} ms) '
+                f'is less than 50% of 8 kHz RT60 '
+                f'({rt60_8k_current * 1000:.0f} ms) — '
                 f'substituting 8 kHz value '
-                f'({rt60_8k_current:.3f} s) at 16 kHz')
+                f'({rt60_8k_current * 1000:.0f} ms) at 16 kHz')
             corrected[16000] = rt60_8k_current
 
     return corrected, warnings
@@ -467,6 +478,8 @@ def rt60_per_band_from_irs(ir_list, fs, bands=OCTAVE_CENTRES):
 
     Returns dict {centre_hz: RT60_seconds} with an additional
     '_hf_warnings' key containing a list of warning strings.
+    The string key is ignored by all integer-keyed lookups
+    elsewhere in the codebase.
     """
     rt60_all = {int(b): [] for b in bands}
     for ir in ir_list:
@@ -984,7 +997,6 @@ def predict_steady_state_from_physics(
         return empty, empty, empty
 
     band_floats = [float(b) for b in bands]
-
     predicted = {}
     tolerance_upper = {}
     tolerance_lower = {}
