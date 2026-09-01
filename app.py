@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Streamlit front end for reverberant field analysis and EQ target
-derivation.
+Streamlit front end for reverberant field analysis and EQ
+target derivation.
 """
 
 import streamlit as st
@@ -60,45 +60,59 @@ st.sidebar.subheader("Room Dimensions")
 
 room_length = st.sidebar.number_input(
     "Length (m)",
-    min_value=1.0, max_value=200.0, value=20.0, step=0.5)
+    min_value=1.0, max_value=200.0,
+    value=20.0, step=0.5)
 room_width = st.sidebar.number_input(
     "Width (m)",
-    min_value=1.0, max_value=100.0, value=15.0, step=0.5)
+    min_value=1.0, max_value=100.0,
+    value=15.0, step=0.5)
 room_height = st.sidebar.number_input(
     "Height (m)",
-    min_value=1.0, max_value=30.0, value=8.0, step=0.5)
+    min_value=1.0, max_value=30.0,
+    value=8.0, step=0.5)
 
 volume = room_length * room_width * room_height
 surface = 2.0 * (
-    room_length * room_width +
-    room_length * room_height +
-    room_width * room_height)
+    room_length * room_width
+    + room_length * room_height
+    + room_width * room_height)
 
 st.sidebar.metric("Volume (m3)", str(round(volume, 1)))
-st.sidebar.metric("Surface area (m2)", str(round(surface, 1)))
+st.sidebar.metric(
+    "Surface area (m2)", str(round(surface, 1)))
 
 listener_distance_m = room_length * (2.0 / 3.0)
 st.sidebar.metric(
     "Listener distance (m)",
     str(round(listener_distance_m, 1)),
     help=(
-        "Estimated as 2/3 of room length. Used for "
-        "DI estimation via classical D/R inversion."))
+        "Estimated as 2/3 of room length. "
+        "Used for DI estimation via classical "
+        "D/R inversion."))
 
 t_mix = mixing_time_ms(volume)
 late_start = late_start_ms(volume)
+
 st.sidebar.metric(
     "Mixing time estimate (ms)",
     str(round(t_mix, 1)),
     help=(
-        "Polack approximation: 0.0117 * V^(1/3). "
-        "Late energy window starts at max(50 ms, mixing time)."))
+        "Empirical approximation: "
+        "0.0033 * V^(1/3) seconds, converted to ms. "
+        "Note: 0.0033 is the mixing time constant. "
+        "Do not confuse with the Polack RT60 constant "
+        "0.0117 which predicts RT60, not mixing time. "
+        "Verified: 500 m3 = 26 ms, 1500 m3 = 38 ms, "
+        "4000 m3 = 52 ms, 8000 m3 = 66 ms."))
+
 st.sidebar.metric(
     "Late energy window start (ms)",
     str(round(late_start, 1)),
     help=(
-        "Late energy window start used for DI estimation. "
-        "max(50 ms floor, Polack mixing time estimate)."))
+        "max(50 ms floor, mixing time estimate). "
+        "The 50 ms floor applies for rooms smaller "
+        "than approximately 3500 m3. "
+        "For larger rooms the mixing time governs."))
 
 st.sidebar.subheader("Measurement Settings")
 
@@ -113,15 +127,18 @@ channel_name = st.sidebar.text_input(
 
 gate_ms_input = st.sidebar.number_input(
     "Gate length ms (0 = auto)",
-    min_value=0.0, max_value=100.0, value=0.0, step=0.5)
+    min_value=0.0, max_value=100.0,
+    value=0.0, step=0.5)
 gate_ms = None if gate_ms_input == 0.0 else gate_ms_input
 
 hf_shelf_hz = st.sidebar.number_input(
     "HF shelf frequency (Hz)",
-    min_value=4000, max_value=16000, value=10000, step=1000)
+    min_value=4000, max_value=16000,
+    value=10000, step=1000)
 hf_shelf_db = st.sidebar.number_input(
     "HF shelf level (dB)",
-    min_value=-6.0, max_value=0.0, value=0.0, step=0.5)
+    min_value=-6.0, max_value=0.0,
+    value=0.0, step=0.5)
 
 XCURVE_REF_HZ = 1000
 
@@ -135,9 +152,9 @@ st.info(
     "Upload WAV files exported from Smaart. "
     "All files are used for spatial averaging of the "
     "reverberant field and RT60 estimation. "
-    "Select the reference position file below — this file "
-    "is used for the gated direct field measurement and "
-    "should be the primary mix position IR.")
+    "Select the reference position file below — this "
+    "file is used for the gated direct field measurement "
+    "and should be the primary mix position IR.")
 
 uploaded_files = st.file_uploader(
     "IR WAV files (upload all positions for this channel)",
@@ -146,7 +163,8 @@ uploaded_files = st.file_uploader(
 
 cal_file = st.file_uploader(
     "Microphone calibration file for reference position "
-    "(two-column CSV: frequency_hz, sensitivity_db — optional)",
+    "(two-column CSV: frequency_hz, sensitivity_db "
+    "— optional)",
     type=["csv"])
 
 ref_filename = None
@@ -160,19 +178,21 @@ if uploaded_files:
             "This file is used for the gated direct field "
             "measurement. It should be the IR recorded at "
             "the primary mix position. All other files "
-            "contribute to the spatially averaged reverberant "
-            "field only."))
+            "contribute to the spatially averaged "
+            "reverberant field only."))
     st.caption(
         "Direct field will be measured from: "
         + "**" + ref_filename + "**. "
-        + "All uploaded files contribute to the reverberant "
-        + "field spatial average and RT60 estimation.")
+        + "All uploaded files contribute to the "
+        + "reverberant field spatial average and "
+        + "RT60 estimation.")
 
 # ---------------------------------------------------------------------------
 # RT60 overrides
 # ---------------------------------------------------------------------------
 
-with st.expander("RT60 overrides (optional)", expanded=False):
+with st.expander(
+        "RT60 overrides (optional)", expanded=False):
     st.caption(
         "Enter manual RT60 values in seconds to override "
         "the calculated values for specific bands. "
@@ -196,17 +216,21 @@ with st.expander("RT60 overrides (optional)", expanded=False):
                         rt60_overrides[int(b)] = parsed
                     else:
                         st.warning(
-                            str(int(b)) + " Hz: value must "
-                            "be between 0.05 and 20.0 s")
+                            str(int(b))
+                            + " Hz: value must be "
+                            "between 0.05 and 20.0 s")
                 except ValueError:
                     st.warning(
-                        str(int(b)) + " Hz: invalid number")
+                        str(int(b))
+                        + " Hz: invalid number")
 
 # ---------------------------------------------------------------------------
 # Process
 # ---------------------------------------------------------------------------
 
-if uploaded_files and ref_filename and st.button("Run Analysis"):
+if (uploaded_files
+        and ref_filename
+        and st.button("Run Analysis")):
 
     with st.spinner(
             "Processing — this may take a moment "
@@ -242,22 +266,24 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             irs.append(ir)
 
         st.success(
-            "Loaded " + str(len(irs)) + " IR file(s) at "
-            + str(ref_fs) + " Hz. "
+            "Loaded " + str(len(irs))
+            + " IR file(s) at " + str(ref_fs) + " Hz. "
             "Reference position: " + ref_filename)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # Octave band analysis — EQ path (normalised)
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
-        direct_levels, gate_ms_used = direct_field_at_bands(
-            ref_ir, ref_fs, gate_ms=gate_ms)
+        direct_levels, gate_ms_used = \
+            direct_field_at_bands(
+                ref_ir, ref_fs, gate_ms=gate_ms)
 
         transition_hz = transition_frequency_from_gate(
             gate_ms_used, bands=OCTAVE_CENTRES)
 
         st.info(
-            "Gate detected: " + str(round(gate_ms_used, 1))
+            "Gate detected: "
+            + str(round(gate_ms_used, 1))
             + " ms — transition frequency set to "
             + str(transition_hz) + " Hz (3/T rule)")
 
@@ -268,9 +294,9 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             'hf_shelf_db': hf_shelf_db,
         }
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # RT60 — calculated then apply overrides
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         rt60_bands = rt60_per_band_from_irs(irs, ref_fs)
 
@@ -284,7 +310,8 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
                 rt60_bands[b] = val
                 override_applied.append(
                     str(b) + " Hz: " + old_str
-                    + " -> " + str(round(val * 1000))
+                    + " -> "
+                    + str(round(val * 1000))
                     + " ms (manual override)")
             if override_applied:
                 st.info(
@@ -295,22 +322,23 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
         reverb_levels = spatial_average_reverberant(
             irs, ref_fs)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # Late energy window — derived from room volume
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         late_start_val = late_start_ms(volume)
 
         st.info(
             "Late energy window start: "
             + str(round(late_start_val, 1))
-            + " ms (Polack mixing time estimate "
+            + " ms (mixing time estimate: "
             + str(round(mixing_time_ms(volume), 1))
-            + " ms, 50 ms floor applied)")
+            + " ms, 50 ms floor applied where mixing "
+            + "time < 50 ms)")
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # DI estimation — absolute energy path
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         di = estimate_di_from_multiple_irs(
             irs, ref_fs,
@@ -321,18 +349,19 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             gate_ms=gate_ms_used,
             late_start_ms_val=late_start_val)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # EQ corrections
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
-        hf_corr, lf_corr, all_corr = derive_full_eq_target(
-            direct_levels, reverb_levels, reverb_levels,
-            channel_cfg,
-            transition_hz=transition_hz)
+        hf_corr, lf_corr, all_corr = \
+            derive_full_eq_target(
+                direct_levels, reverb_levels,
+                reverb_levels, channel_cfg,
+                transition_hz=transition_hz)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # 1/3 octave band analysis
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         direct_levels_3rd, _ = \
             direct_field_at_third_octave_bands(
@@ -342,7 +371,8 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             spatial_average_reverberant_third_octave(
                 irs, ref_fs)
 
-        zero_corr = {int(b): 0.0 for b in OCTAVE_CENTRES}
+        zero_corr = {
+            int(b): 0.0 for b in OCTAVE_CENTRES}
         predicted_room_curve_3rd = \
             predict_post_eq_steady_state_third_octave(
                 direct_levels_3rd,
@@ -356,14 +386,17 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
                 direct_levels_3rd,
                 reverb_levels_3rd)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # Reference level and normalisation
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
-        ref_level_3rd = direct_levels_3rd.get(1000.0, None)
-        if ref_level_3rd is None or np.isnan(ref_level_3rd):
+        ref_level_3rd = direct_levels_3rd.get(
+            1000.0, None)
+        if (ref_level_3rd is None
+                or np.isnan(ref_level_3rd)):
             available = {
-                k: v for k, v in direct_levels_3rd.items()
+                k: v
+                for k, v in direct_levels_3rd.items()
                 if not np.isnan(v)}
             if available:
                 ref_level_3rd = available[
@@ -382,50 +415,60 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
         reverb_3rd_norm = norm(reverb_levels_3rd)
         room_curve_norm = norm(predicted_room_curve_3rd)
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # X-curve
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         xcurve_large = xcurve_at_third_octave_bands(
-            bands=THIRD_OCTAVE_CENTRES, screen_size='large')
+            bands=THIRD_OCTAVE_CENTRES,
+            screen_size='large')
         xcurve_small = xcurve_at_third_octave_bands(
-            bands=THIRD_OCTAVE_CENTRES, screen_size='small')
+            bands=THIRD_OCTAVE_CENTRES,
+            screen_size='small')
 
-        third_oct_sorted = sorted(direct_levels_3rd.keys())
+        third_oct_sorted = sorted(
+            direct_levels_3rd.keys())
         direct_vals_sorted = [
-            direct_levels_3rd[b] for b in third_oct_sorted]
+            direct_levels_3rd[b]
+            for b in third_oct_sorted]
         ref_direct_level = float(np.interp(
             np.log10(float(XCURVE_REF_HZ)),
             np.log10(third_oct_sorted),
             direct_vals_sorted))
 
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
         # Save outputs
-        # -----------------------------------------------------------
+        # ---------------------------------------------------
 
         df = save_csv(
-            direct_levels, reverb_levels, di, rt60_bands,
-            all_corr, channel_name, str(out_dir))
+            direct_levels, reverb_levels, di,
+            rt60_bands, all_corr,
+            channel_name, str(out_dir))
 
         eq_target_path = (
-            out_dir / (channel_name + "_eq_target.txt"))
+            out_dir
+            / (channel_name + "_eq_target.txt"))
 
-        after_3rd = predict_post_eq_steady_state_third_octave(
-            direct_levels_3rd,
-            reverb_levels_3rd,
-            all_corr,
-            transition_hz=transition_hz,
-            half_octave_overlap=True)
+        after_3rd = \
+            predict_post_eq_steady_state_third_octave(
+                direct_levels_3rd,
+                reverb_levels_3rd,
+                all_corr,
+                transition_hz=transition_hz,
+                half_octave_overlap=True)
         after_3rd_norm = norm(after_3rd)
 
         export_target_for_smaart(
             target_levels_3rd=after_3rd_norm,
             ref_level_db=ref_level_3rd,
             output_path=eq_target_path,
-            label=channel_name + " EQ Target — " + room_name)
+            label=(channel_name
+                   + " EQ Target — "
+                   + room_name))
 
         xcurve_large_path = (
-            out_dir / (channel_name + "_xcurve_large.txt"))
+            out_dir
+            / (channel_name + "_xcurve_large.txt"))
         export_xcurve_for_smaart(
             xcurve_levels_3rd=xcurve_large,
             ref_level_db=ref_direct_level,
@@ -433,7 +476,8 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             screen_size='large')
 
         xcurve_small_path = (
-            out_dir / (channel_name + "_xcurve_small.txt"))
+            out_dir
+            / (channel_name + "_xcurve_small.txt"))
         export_xcurve_for_smaart(
             xcurve_levels_3rd=xcurve_small,
             ref_level_db=ref_direct_level,
@@ -442,41 +486,4 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
 
         st.session_state.update({
             'direct_3rd_norm': direct_3rd_norm,
-            'reverb_3rd_norm': reverb_3rd_norm,
-            'room_curve_norm': room_curve_norm,
-            'xcurve_large': xcurve_large,
-            'xcurve_small': xcurve_small,
-            'rt60_bands': rt60_bands,
-            'rt60_warnings': rt60_warnings,
-            'di': di,
-            'gate_ms_used': gate_ms_used,
-            'transition_hz': transition_hz,
-            'df': df,
-            'eq_target_path': str(eq_target_path),
-            'xcurve_large_path': str(xcurve_large_path),
-            'xcurve_small_path': str(xcurve_small_path),
-            'ref_filename': ref_filename,
-            'n_irs': len(irs),
-            'listener_distance_m': listener_distance_m,
-            'volume': volume,
-            'surface': surface,
-            'late_start_val': late_start_val,
-            'analysis_complete': True,
-        })
-
-# ---------------------------------------------------------------------------
-# Display
-# ---------------------------------------------------------------------------
-
-if st.session_state.get('analysis_complete'):
-
-    direct_3rd_norm = st.session_state['direct_3rd_norm']
-    reverb_3rd_norm = st.session_state['reverb_3rd_norm']
-    room_curve_norm = st.session_state['room_curve_norm']
-    xcurve_large = st.session_state['xcurve_large']
-    xcurve_small = st.session_state['xcurve_small']
-    rt60_bands = st.session_state['rt60_bands']
-    rt60_warnings = st.session_state['rt60_warnings']
-    di = st.session_state['di']
-    gate_ms_used = st.session_state['gate_ms_used']
-    transition_hz = st.session_state
+            'reverb_
