@@ -8,6 +8,7 @@ Processes IRs exported from Smaart (WAV format) to compute:
   - DI estimate from classical D/R inversion
   - EQ correction targets per octave band
   - Steady-state reconstruction from measured fields
+  - Parametric EQ filter recommendations
   - Output plots and CSV report
 
 Usage:
@@ -51,7 +52,8 @@ THIRD_OCTAVE_CENTRES = np.array([
 
 def third_octave_band_limits(centre_hz):
     """Return (f_low, f_high) for a 1/3-octave band."""
-    return centre_hz / (2 ** (1.0 / 6)), centre_hz * (2 ** (1.0 / 6))
+    return (centre_hz / (2 ** (1.0 / 6)),
+            centre_hz * (2 ** (1.0 / 6)))
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +62,7 @@ def third_octave_band_limits(centre_hz):
 
 def truncation_margin_for_band(centre_hz):
     """
-    Return the noise floor truncation margin in dB for a given
-    centre frequency.
+    Return the noise floor truncation margin in dB.
 
       Below 500 Hz:    10 dB
       500 Hz to 4 kHz: 12 dB
@@ -100,8 +101,7 @@ def load_ir(filepath):
 def apply_calibration(ir, fs, cal_file):
     """
     Apply a microphone calibration curve to an IR.
-    cal_file: path to a two-column CSV
-    (frequency_hz, sensitivity_db).
+    cal_file: two-column CSV (frequency_hz, sensitivity_db).
     """
     if cal_file is None or not os.path.exists(cal_file):
         return ir
@@ -110,12 +110,12 @@ def apply_calibration(ir, fs, cal_file):
     sens_db = cal[:, 1]
     n = len(ir)
     fft_freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-    interp_sens = np.interp(fft_freqs, freqs, sens_db,
-                            left=sens_db[0], right=sens_db[-1])
+    interp_sens = np.interp(
+        fft_freqs, freqs, sens_db,
+        left=sens_db[0], right=sens_db[-1])
     correction = 10.0 ** (-interp_sens / 20.0)
     spectrum = np.fft.rfft(ir)
-    spectrum_corrected = spectrum * correction
-    return np.fft.irfft(spectrum_corrected, n=n)
+    return np.fft.irfft(spectrum * correction, n=n)
 
 
 # ---------------------------------------------------------------------------
@@ -124,36 +124,21 @@ def apply_calibration(ir, fs, cal_file):
 
 def compute_etc(ir, fs, smooth_ms=1.0):
     """
-    Compute the Energy Time Curve (ETC) of an impulse response.
-
-    The ETC is the squared magnitude of the analytic signal
-    (Hilbert envelope squared), smoothed with a short moving
-    average to reduce noise without obscuring the direct
-    arrival onset.
-
-    Returns the ETC in dB normalised to 0 dB at peak.
+    Compute the Energy Time Curve (ETC).
+    Returns ETC in dB normalised to 0 dB at peak.
     """
     analytic = sig.hilbert(ir)
     envelope_sq = np.abs(analytic) ** 2
     window = max(1, int(smooth_ms * fs / 1000.0))
     smoothed = np.convolve(
-        envelope_sq,
-        np.ones(window) / window,
-        mode='same')
+        envelope_sq, np.ones(window) / window, mode='same')
     smoothed = np.maximum(smoothed, 1e-30)
-    etc_db = 10.0 * np.log10(smoothed / np.max(smoothed))
-    return etc_db
+    return 10.0 * np.log10(smoothed / np.max(smoothed))
 
 
 def detect_direct_arrival(ir, fs, threshold_db=-20):
     """
-    Find the sample index of the direct arrival using ETC
-    analysis.
-
-    Computes the ETC and finds the first sample that exceeds
-    threshold_db relative to the peak. Using the ETC rather
-    than the raw IR prevents noise transients before the direct
-    arrival from being mistaken for the onset.
+    Find the sample index of the direct arrival using ETC.
     """
     etc_db = compute_etc(ir, fs, smooth_ms=0.5)
     candidates = np.where(etc_db >= threshold_db)[0]
@@ -163,25 +148,16 @@ def detect_direct_arrival(ir, fs, threshold_db=-20):
 def detect_first_reflection(ir, fs, direct_idx,
                              min_gap_ms=2.0):
     """
-    Estimate the arrival time of the first significant
-    reflection using ETC analysis.
-
-    Searches for the first local peak in the ETC after the
-    direct arrival that exceeds -20 dB relative to the direct
-    peak.
-
-    Returns sample index or None if not found.
+    Estimate the first significant reflection using ETC.
+    Returns sample index or None.
     """
     etc_db = compute_etc(ir, fs, smooth_ms=0.5)
     min_gap = int(min_gap_ms * fs / 1000.0)
     search_start = direct_idx + min_gap
-    direct_level_db = etc_db[direct_idx]
-    threshold_db = direct_level_db - 20.0
+    threshold_db = etc_db[direct_idx] - 20.0
     search = etc_db[search_start:]
     peaks, _ = sig.find_peaks(
-        search,
-        height=threshold_db,
-        distance=min_gap)
+        search, height=threshold_db, distance=min_gap)
     if len(peaks) == 0:
         return None
     return int(search_start + peaks[0])
@@ -193,30 +169,23 @@ def detect_first_reflection(ir, fs, direct_idx,
 
 def truncate_to_noise_floor(ir, margin_db=10.0):
     """
-    Truncate an IR at the point where the envelope drops to
-    margin_db above the dynamic noise floor.
+    Truncate an IR at margin_db above the noise floor.
     """
     peak = np.max(np.abs(ir))
     if peak == 0:
         return ir
-
     window_samples = max(1, len(ir) // 200)
-    envelope = np.abs(ir)
     smoothed = scipy.ndimage.maximum_filter1d(
-        envelope, size=window_samples)
+        np.abs(ir), size=window_samples)
     smoothed_db = 20.0 * np.log10(smoothed / peak + 1e-30)
-
     tail_start = int(len(smoothed_db) * 0.9)
     noise_floor_db = float(np.mean(smoothed_db[tail_start:]))
-    truncation_threshold_db = noise_floor_db + margin_db
-
-    above = np.where(smoothed_db >= truncation_threshold_db)[0]
+    threshold_db = noise_floor_db + margin_db
+    above = np.where(smoothed_db >= threshold_db)[0]
     if len(above) == 0:
         return ir[:len(ir) // 2]
-
-    cutoff = above[-1]
     truncated = ir.copy()
-    truncated[cutoff:] = 0.0
+    truncated[above[-1]:] = 0.0
     return truncated
 
 
@@ -226,19 +195,17 @@ def truncate_to_noise_floor(ir, margin_db=10.0):
 
 def bandpass_ir(ir, fs, f_low, f_high, order=4):
     """
-    Bandpass filter an IR using a zero-phase Butterworth filter.
-
-    order defaults to 4. Pass order=2 for low frequency bands
-    (63 Hz and below) to prevent sosfiltfilt ringing on
-    narrow-bandwidth IRs.
+    Zero-phase Butterworth bandpass filter.
+    order=2 for 63 Hz and below to prevent ringing.
     """
     nyq = fs / 2.0
     f_low = max(f_low, 10.0)
     f_high = min(f_high, nyq * 0.99)
     if f_low >= f_high:
         return np.zeros_like(ir)
-    sos = sig.butter(order, [f_low / nyq, f_high / nyq],
-                     btype='band', output='sos')
+    sos = sig.butter(
+        order, [f_low / nyq, f_high / nyq],
+        btype='band', output='sos')
     return sig.sosfiltfilt(sos, ir)
 
 
@@ -248,35 +215,31 @@ def bandpass_ir(ir, fs, f_low, f_high, order=4):
 
 def schroeder_decay(ir_band):
     """
-    Compute the Schroeder backward integral with noise energy
-    subtraction. Returns the decay curve normalised so the
-    initial value is 0 dB.
+    Schroeder backward integral with noise subtraction.
+    Returns decay curve normalised to 0 dB at start.
     """
     power = ir_band ** 2
     tail_start = int(len(power) * 0.9)
     noise_power = float(np.mean(power[tail_start:]))
-    power_compensated = np.maximum(power - noise_power, 0.0)
-    decay = np.cumsum(power_compensated[::-1])[::-1]
+    power_comp = np.maximum(power - noise_power, 0.0)
+    decay = np.cumsum(power_comp[::-1])[::-1]
     decay = np.maximum(decay, 1e-30)
-    decay_db = 10.0 * np.log10(decay / decay[0])
-    return decay_db
+    return 10.0 * np.log10(decay / decay[0])
 
 
 def initial_decay_level(ir, fs, centre_hz):
     """
-    Return the initial Schroeder decay level for one octave
-    band. Used for reverberant field spectral shape display
-    only. Not used for DI estimation.
+    Schroeder initial decay level for one octave band.
+    Used for reverberant field display only.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     order = 2 if centre_hz <= 63 else 4
     ir_band = bandpass_ir(ir, fs, f_low, f_high, order=order)
     direct_idx = detect_direct_arrival(
         ir_band, fs, threshold_db=-20)
-    ir_band = ir_band[direct_idx:]
-    margin_db = truncation_margin_for_band(centre_hz)
     ir_band = truncate_to_noise_floor(
-        ir_band, margin_db=margin_db)
+        ir_band[direct_idx:],
+        margin_db=truncation_margin_for_band(centre_hz))
     decay_db = schroeder_decay(ir_band)
     n_avg = max(1, int(0.005 * fs))
     return float(np.mean(decay_db[:n_avg]))
@@ -284,9 +247,8 @@ def initial_decay_level(ir, fs, centre_hz):
 
 def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
     """
-    Return the Schroeder initial decay level for each octave
-    band. Returns dict {centre_hz: level_db}.
-    Used for spectral shape display only.
+    Schroeder initial decay level per octave band.
+    Returns dict {centre_hz: level_db}.
     """
     return {int(b): initial_decay_level(ir, fs, b)
             for b in bands}
@@ -298,63 +260,31 @@ def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
 
 def mixing_time_ms(volume_m3):
     """
-    Estimate the mixing time in milliseconds from room volume.
+    Estimate mixing time in ms from room volume.
 
-    Uses the empirical approximation:
+    Empirical approximation:
       t_mix = 0.0033 * V^(1/3)  seconds
 
-    The mixing time is the point at which the reverberant field
-    becomes diffuse. Before this point the IR contains strong
-    discrete reflections (ceiling, sidewalls, console) that are
-    not true reverberant energy. Including them in the late
-    energy measurement inflates the reverberant level and
-    causes DI to be underestimated.
+    Constant 0.0033 is the mixing time constant.
+    Do NOT confuse with Polack RT60 constant 0.0117.
 
-    The constant 0.0033 is the mixing time constant.
-    Do not confuse with the Polack RT60 prediction constant
-    0.0117 — that predicts RT60, not mixing time.
-
-    Verified reference values:
-      V =  500 m3  (small cinema)    t_mix ~  26 ms
-      V = 1500 m3  (medium cinema)   t_mix ~  38 ms
-      V = 4000 m3  (large stage)     t_mix ~  52 ms
-      V = 8000 m3  (very large)      t_mix ~  66 ms
-
-    Verification:
-      0.0033 * 500^(1/3)  = 0.0033 * 7.937  = 26.2 ms
-      0.0033 * 1500^(1/3) = 0.0033 * 11.447 = 37.8 ms
-      0.0033 * 4000^(1/3) = 0.0033 * 15.874 = 52.4 ms
-      0.0033 * 8000^(1/3) = 0.0033 * 20.000 = 66.0 ms
-
-    Returns mixing time in milliseconds.
+    Verified:
+      500 m3  -> 26 ms
+      1500 m3 -> 38 ms
+      4000 m3 -> 52 ms
+      8000 m3 -> 66 ms
     """
     if volume_m3 <= 0:
         return 50.0
-    t_mix_s = 0.0033 * (volume_m3 ** (1.0 / 3.0))
-    return float(t_mix_s * 1000.0)
+    return float(0.0033 * (volume_m3 ** (1.0 / 3.0)) * 1000.0)
 
 
 def late_start_ms(volume_m3, floor_ms=50.0):
     """
-    Return the late energy start time in milliseconds.
-
-    Derived as max(floor_ms, mixing_time_ms(volume_m3)).
-
-    floor_ms defaults to 50 ms. This is the minimum late start
-    regardless of room volume.
-
-    The 50 ms floor has practical effect for rooms smaller than
-    approximately 3500 m3 where the mixing time estimate falls
-    below 50 ms. For larger rooms the mixing time estimate
-    exceeds 50 ms and governs the late start.
-
-    In large rooms where the mixing time exceeds 50 ms the
-    late start is extended accordingly to avoid including
-    strong early reflections in the reverberant energy
-    estimate.
+    Late energy window start = max(floor_ms, mixing_time_ms).
+    50 ms floor applies for rooms smaller than ~3500 m3.
     """
-    t_mix = mixing_time_ms(volume_m3)
-    return float(max(floor_ms, t_mix))
+    return float(max(floor_ms, mixing_time_ms(volume_m3)))
 
 
 # ---------------------------------------------------------------------------
@@ -364,47 +294,32 @@ def late_start_ms(volume_m3, floor_ms=50.0):
 def direct_reverb_energy(ir, fs, centre_hz,
                           gate_ms, late_start_ms_val=50.0):
     """
-    Calculate true direct and reverberant energies from the
-    impulse response in one octave band.
+    True direct and reverberant energies in one octave band.
 
-    Direct energy:
-      From direct arrival to gate end.
-
-    Reverberant (late) energy:
-      From late_start_ms_val onward.
-
-    late_start_ms_val should be derived from late_start_ms()
-    using the room volume so that the late energy window begins
-    after the mixing time.
+    Direct:     direct arrival to gate end
+    Reverberant: from late_start_ms_val onward
 
     Returns direct_db, reverb_db (absolute, not normalised).
-    These preserve the D/R ratio needed for DI inversion.
+    Preserves D/R ratio for DI inversion.
 
-    NOTE: The two measurement paths are completely separate:
-      EQ path:  normalised gated spectrum from
-                gated_direct_field()
-      DI path:  absolute energy from direct_reverb_energy()
+    NOTE: Completely separate from the EQ path.
+      EQ path:  normalised gated spectrum
+      DI path:  absolute energy ratios
     """
     f_low, f_high = octave_band_limits(centre_hz)
     order = 2 if centre_hz <= 63 else 4
     ir_band = bandpass_ir(ir, fs, f_low, f_high, order=order)
-
     direct_idx = detect_direct_arrival(ir_band, fs)
     gate_samples = int(gate_ms * fs / 1000.0)
-    direct_end = min(len(ir_band),
-                     direct_idx + gate_samples)
+    direct_end = min(len(ir_band), direct_idx + gate_samples)
     late_start = min(len(ir_band),
                      int(late_start_ms_val * fs / 1000.0))
-
-    direct_energy = np.sum(
-        ir_band[direct_idx:direct_end] ** 2)
+    direct_energy = np.sum(ir_band[direct_idx:direct_end] ** 2)
     late_energy = np.sum(ir_band[late_start:] ** 2)
-
     direct_db = (10.0 * np.log10(direct_energy)
                  if direct_energy > 0 else np.nan)
     reverb_db = (10.0 * np.log10(late_energy)
                  if late_energy > 0 else np.nan)
-
     return direct_db, reverb_db
 
 
@@ -412,12 +327,8 @@ def direct_reverb_energy_all_bands(ir, fs, gate_ms,
                                     late_start_ms_val=50.0,
                                     bands=OCTAVE_CENTRES):
     """
-    Compute direct and late energy for all octave bands.
-
-    late_start_ms_val should be derived from late_start_ms()
-    using the room volume.
-
-    Returns two dicts: direct_db, reverb_db keyed by band.
+    Direct and late energy for all octave bands.
+    Returns two dicts keyed by band.
     """
     direct_db = {}
     reverb_db = {}
@@ -436,65 +347,43 @@ def direct_reverb_energy_all_bands(ir, fs, gate_ms,
 
 def rt60_from_schroeder(ir, fs, centre_hz):
     """
-    Estimate RT60 in one octave band from the Schroeder decay
-    curve.
+    RT60 from Schroeder decay in one octave band.
 
-    Below 8 kHz:  T20 primary, T30 fallback, EDT last resort.
-    8 kHz and above: EDT primary, T20 fallback, T30 last resort.
+    Below 8 kHz:  T20 primary, T30 fallback, EDT last.
+    8 kHz+:       EDT primary, T20 fallback, T30 last.
 
-    Filter order reduced to 2 at 63 Hz and below.
-    Minimum slope threshold relaxed at high frequencies.
-
-    Returns RT60 in seconds, or None if unreliable.
+    Returns RT60 in seconds or None.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     order = 2 if centre_hz <= 63 else 4
-
     nyq = fs / 2.0
     fl = max(f_low, 10.0)
     fh = min(f_high, nyq * 0.99)
     if fl >= fh:
         return None
-
     sos = sig.butter(order, [fl / nyq, fh / nyq],
                      btype='band', output='sos')
     ir_band = sig.sosfiltfilt(sos, ir)
-
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
-
     direct_idx = detect_direct_arrival(
         ir_band, fs, threshold_db=-20)
     ir_band = ir_band[direct_idx:]
-
     if len(ir_band) < int(0.05 * fs):
         return None
-
-    margin_db = truncation_margin_for_band(centre_hz)
     ir_band = truncate_to_noise_floor(
-        ir_band, margin_db=margin_db)
-
+        ir_band,
+        margin_db=truncation_margin_for_band(centre_hz))
     if np.max(np.abs(ir_band)) < 1e-10:
         return None
-
     decay_db = schroeder_decay(ir_band)
     times = np.arange(len(decay_db)) / fs
-
     if centre_hz >= 8000:
-        eval_ranges = [
-            (0,   -10),
-            (-5,  -25),
-            (-5,  -35),
-        ]
+        eval_ranges = [(0, -10), (-5, -25), (-5, -35)]
         min_slope = -0.1
     else:
-        eval_ranges = [
-            (-5,  -25),
-            (-5,  -35),
-            (0,   -10),
-        ]
+        eval_ranges = [(-5, -25), (-5, -35), (0, -10)]
         min_slope = -0.5
-
     for lo, hi in eval_ranges:
         mask = (decay_db <= lo) & (decay_db >= hi)
         if mask.sum() < 10:
@@ -503,73 +392,55 @@ def rt60_from_schroeder(ir, fs, centre_hz):
         d_region = decay_db[mask]
         if d_region[-1] >= d_region[0]:
             continue
-        coeffs = np.polyfit(t_region, d_region, 1)
-        slope = coeffs[0]
+        slope = np.polyfit(t_region, d_region, 1)[0]
         if slope >= min_slope:
             continue
         rt60 = -60.0 / slope
         if 0.05 <= rt60 <= 20.0:
             return float(rt60)
-
     return None
 
 
 # ---------------------------------------------------------------------------
-# HF RT60 fallback logic
+# HF RT60 fallback
 # ---------------------------------------------------------------------------
 
 def apply_rt60_hf_fallback(rt60_dict):
     """
-    Apply high-frequency RT60 fallback logic.
+    HF RT60 fallback logic.
 
-    Rule 1: If RT60 at 8 kHz < 50% of RT60 at 4 kHz,
-      replace 8 kHz and 16 kHz with the 4 kHz value.
-
-    Rule 2 (only if Rule 1 did not trigger):
-      If RT60 at 16 kHz < 50% of RT60 at 8 kHz,
-      replace 16 kHz with the 8 kHz value.
+    Rule 1: 8 kHz < 50% of 4 kHz -> replace 8k and 16k.
+    Rule 2: 16 kHz < 50% of 8 kHz -> replace 16k.
 
     Returns corrected dict and list of warning strings.
     """
     corrected = dict(rt60_dict)
     warnings = []
-
     rt60_4k = corrected.get(4000)
     rt60_8k = corrected.get(8000)
-
-    if (rt60_4k is not None
-            and rt60_8k is not None
-            and rt60_4k > 0):
-        if (rt60_8k / rt60_4k) < 0.50:
-            warnings.append(
-                '8 kHz RT60 ('
-                + str(round(rt60_8k * 1000))
-                + ' ms) is less than 50% of 4 kHz RT60 ('
-                + str(round(rt60_4k * 1000))
-                + ' ms) — substituting 4 kHz value ('
-                + str(round(rt60_4k * 1000))
-                + ' ms) at 8 kHz and 16 kHz')
-            corrected[8000] = rt60_4k
-            corrected[16000] = rt60_4k
-            return corrected, warnings
-
+    if (rt60_4k is not None and rt60_8k is not None
+            and rt60_4k > 0
+            and (rt60_8k / rt60_4k) < 0.50):
+        warnings.append(
+            '8 kHz RT60 ('
+            + str(round(rt60_8k * 1000)) + ' ms) < 50% of '
+            '4 kHz RT60 (' + str(round(rt60_4k * 1000))
+            + ' ms) — substituting 4 kHz value at 8k and 16k')
+        corrected[8000] = rt60_4k
+        corrected[16000] = rt60_4k
+        return corrected, warnings
     rt60_8k_c = corrected.get(8000)
     rt60_16k_c = corrected.get(16000)
-
-    if (rt60_8k_c is not None
-            and rt60_16k_c is not None
-            and rt60_8k_c > 0):
-        if (rt60_16k_c / rt60_8k_c) < 0.50:
-            warnings.append(
-                '16 kHz RT60 ('
-                + str(round(rt60_16k_c * 1000))
-                + ' ms) is less than 50% of 8 kHz RT60 ('
-                + str(round(rt60_8k_c * 1000))
-                + ' ms) — substituting 8 kHz value ('
-                + str(round(rt60_8k_c * 1000))
-                + ' ms) at 16 kHz')
-            corrected[16000] = rt60_8k_c
-
+    if (rt60_8k_c is not None and rt60_16k_c is not None
+            and rt60_8k_c > 0
+            and (rt60_16k_c / rt60_8k_c) < 0.50):
+        warnings.append(
+            '16 kHz RT60 ('
+            + str(round(rt60_16k_c * 1000))
+            + ' ms) < 50% of 8 kHz RT60 ('
+            + str(round(rt60_8k_c * 1000))
+            + ' ms) — substituting 8 kHz value at 16k')
+        corrected[16000] = rt60_8k_c
     return corrected, warnings
 
 
@@ -580,11 +451,11 @@ def apply_rt60_hf_fallback(rt60_dict):
 def rt60_per_band_from_irs(ir_list, fs,
                             bands=OCTAVE_CENTRES):
     """
-    Estimate RT60 per octave band by averaging across all IR
-    positions. Applies HF fallback after averaging.
+    RT60 per octave band averaged across all IR positions.
 
-    Returns dict {centre_hz: RT60_seconds} with an additional
-    '_hf_warnings' key containing substitution warning strings.
+    Returns dict with integer band keys plus:
+      '_hf_warnings': list of substitution warning strings
+      '_measured':    dict of raw pre-fallback values
     """
     rt60_all = {int(b): [] for b in bands}
     for ir in ir_list:
@@ -596,8 +467,12 @@ def rt60_per_band_from_irs(ir_list, fs,
     averaged = {b: float(np.mean(v)) if v else None
                 for b, v in rt60_all.items()}
 
+    # Store measured values before fallback
+    measured = dict(averaged)
+
     corrected, hf_warnings = apply_rt60_hf_fallback(averaged)
     corrected['_hf_warnings'] = hf_warnings
+    corrected['_measured'] = measured
 
     return corrected
 
@@ -609,33 +484,25 @@ def rt60_per_band_from_irs(ir_list, fs,
 def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
     """
     Check RT60 values for physical plausibility.
-    Returns a dict of warnings keyed by band.
-    Includes HF fallback substitution warnings.
+    Returns dict of warnings keyed by band.
     """
     warnings = {}
     bands_int = [int(b) for b in bands]
-
-    hf_warnings = rt60_per_band.get('_hf_warnings', [])
-    for i, w in enumerate(hf_warnings):
+    for i, w in enumerate(
+            rt60_per_band.get('_hf_warnings', [])):
         warnings['hf_fallback_' + str(i)] = w
-
     valid = {b: rt60_per_band.get(b) for b in bands_int
              if rt60_per_band.get(b) is not None}
-
     if not valid:
-        warnings['general'] = (
-            'No valid RT60 estimates produced')
+        warnings['general'] = 'No valid RT60 estimates'
         return warnings
-
     for b, rt in valid.items():
         if rt > 15.0:
-            warnings[b] = (
-                str(round(rt, 2)) + ' s is implausibly long')
+            warnings[b] = (str(round(rt, 2))
+                           + ' s is implausibly long')
         if rt < 0.05:
-            warnings[b] = (
-                str(round(rt, 3))
-                + ' s is implausibly short')
-
+            warnings[b] = (str(round(rt, 3))
+                           + ' s is implausibly short')
     mf_bands = [b for b in [500, 1000, 2000] if b in valid]
     hf_bands = [b for b in [4000, 8000] if b in valid]
     if mf_bands and hf_bands:
@@ -643,12 +510,9 @@ def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
         hf_avg = np.mean([valid[b] for b in hf_bands])
         if hf_avg > mf_avg * 1.5:
             warnings['hf_rising'] = (
-                'HF RT60 ('
-                + str(round(hf_avg, 2))
-                + ' s) is higher than MF RT60 ('
-                + str(round(mf_avg, 2))
+                'HF RT60 (' + str(round(hf_avg, 2))
+                + ' s) > MF RT60 (' + str(round(mf_avg, 2))
                 + ' s) — check IR length and noise floor')
-
     return warnings
 
 
@@ -658,113 +522,71 @@ def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
 
 def room_constant(rt60_s, volume_m3, surface_area_m2):
     """
-    Derive the room constant R from RT60.
-
-    Uses Sabine inversion when alpha <= 0.2 and Eyring
-    inversion when alpha > 0.2.
-
-    Sabine:
-      alpha_s = 0.161 * V / (T * S)
-      R       = S * alpha_s / (1 - alpha_s)
-
-    Eyring:
-      alpha_e = 1 - exp(-0.161 * V / (T * S))
-      R       = S * alpha_e / (1 - alpha_e)
-
-    Eyring is more accurate for alpha > 0.2 which is common
-    in modern mix rooms with significant acoustic treatment.
-    The threshold of 0.2 is the conventional crossover point
-    in room acoustics literature.
-
-    Returns R in m2, or None if inputs are invalid.
+    Room constant R from RT60.
+    Sabine when alpha <= 0.2, Eyring when alpha > 0.2.
+    Returns R in m2 or None.
     """
     if rt60_s is None or rt60_s <= 0:
         return None
     if surface_area_m2 <= 0 or volume_m3 <= 0:
         return None
-
-    alpha_sabine = 0.161 * volume_m3 / (
-        rt60_s * surface_area_m2)
-    alpha_sabine = min(alpha_sabine, 0.999)
-
-    if alpha_sabine <= 0.2:
-        alpha = alpha_sabine
+    alpha_s = min(
+        0.161 * volume_m3 / (rt60_s * surface_area_m2),
+        0.999)
+    if alpha_s <= 0.2:
+        alpha = alpha_s
     else:
-        alpha_eyring = 1.0 - np.exp(
-            -0.161 * volume_m3
-            / (rt60_s * surface_area_m2))
-        alpha_eyring = min(alpha_eyring, 0.999)
-        alpha = alpha_eyring
-
-    R = surface_area_m2 * alpha / (1.0 - alpha)
-    return float(R)
+        alpha = min(
+            1.0 - np.exp(
+                -0.161 * volume_m3
+                / (rt60_s * surface_area_m2)),
+            0.999)
+    return float(surface_area_m2 * alpha / (1.0 - alpha))
 
 
 def room_constant_formula_used(rt60_s, volume_m3,
                                 surface_area_m2):
-    """
-    Return a string indicating which formula was used for R.
-    Returns 'Sabine', 'Eyring', or 'invalid'.
-    """
+    """Return 'Sabine', 'Eyring', or 'invalid'."""
     if rt60_s is None or rt60_s <= 0:
         return 'invalid'
     if surface_area_m2 <= 0 or volume_m3 <= 0:
         return 'invalid'
-    alpha_sabine = 0.161 * volume_m3 / (
-        rt60_s * surface_area_m2)
-    alpha_sabine = min(alpha_sabine, 0.999)
-    return 'Sabine' if alpha_sabine <= 0.2 else 'Eyring'
+    alpha_s = min(
+        0.161 * volume_m3 / (rt60_s * surface_area_m2),
+        0.999)
+    return 'Sabine' if alpha_s <= 0.2 else 'Eyring'
 
 
 # ---------------------------------------------------------------------------
 # DI estimation — classical D/R inversion
 # ---------------------------------------------------------------------------
 
-def estimate_di(direct_energy_db,
-                reverb_energy_db,
-                rt60_per_band,
-                volume_m3,
-                surface_area_m2,
-                listener_distance_m,
-                bands=OCTAVE_CENTRES):
+def estimate_di(direct_energy_db, reverb_energy_db,
+                rt60_per_band, volume_m3, surface_area_m2,
+                listener_distance_m, bands=OCTAVE_CENTRES):
     """
-    Estimate DI(f) per octave band using classical D/R
-    inversion.
-
-      D/R = Q * R / (16 * pi * r^2)
-      Q   = (16 * pi * r^2 / R) * (D/R)
-      DI  = 10 * log10(Q)
-
-    DI is clipped to [0, 20] dB.
-    Returns dict {centre_hz: DI_dB}.
+    DI per octave band via classical D/R inversion.
+      Q  = (16 * pi * r^2 / R) * (D/R)
+      DI = 10 * log10(Q)
+    Clipped to [0, 20] dB.
     """
     di = {}
     for b in bands:
         b = int(b)
         d_db = direct_energy_db.get(b, np.nan)
         r_db = reverb_energy_db.get(b, np.nan)
-        rt60 = rt60_per_band.get(b)
-        R = room_constant(rt60, volume_m3, surface_area_m2)
-
-        if (np.isnan(d_db)
-                or np.isnan(r_db)
-                or R is None
-                or R <= 0
+        R = room_constant(
+            rt60_per_band.get(b), volume_m3, surface_area_m2)
+        if (np.isnan(d_db) or np.isnan(r_db)
+                or R is None or R <= 0
                 or listener_distance_m <= 0):
             di[b] = np.nan
             continue
-
         D_over_R = 10.0 ** ((d_db - r_db) / 10.0)
-        Q = ((16.0 * np.pi * listener_distance_m ** 2)
+        Q = (16.0 * np.pi * listener_distance_m ** 2
              / R) * D_over_R
-
-        if Q <= 0:
-            di[b] = np.nan
-            continue
-
-        di[b] = float(
-            np.clip(10.0 * np.log10(Q), 0.0, 20.0))
-
+        di[b] = (float(np.clip(10.0 * np.log10(Q), 0.0, 20.0))
+                 if Q > 0 else np.nan)
     return di
 
 
@@ -777,53 +599,31 @@ def estimate_di_from_multiple_irs(ir_list, fs,
                                    late_start_ms_val=None,
                                    bands=OCTAVE_CENTRES):
     """
-    Estimate DI per octave band using median Q across all IR
-    positions.
-
-    late_start_ms_val: if None, derived automatically from
-    volume_m3 using late_start_ms(). Pass an explicit value
-    to override.
-
-    For each position the D/R ratio is computed from true
-    direct and late energy. Q is derived per position per
-    band. The median Q across positions is used to compute
-    the final DI.
-
-    Using the median is more robust against outliers from
-    boundary positions and reflection hot spots.
-
-    DI is clipped to [0, 20] dB.
-    Returns dict {centre_hz: DI_dB}.
+    DI per octave band using median Q across all IR positions.
+    late_start_ms_val derived from volume if not supplied.
+    Clipped to [0, 20] dB.
     """
     if late_start_ms_val is None:
         late_start_ms_val = late_start_ms(volume_m3)
-
     q_per_band = {int(b): [] for b in bands}
-
     for ir in ir_list:
         for b in bands:
             b_int = int(b)
             d_db, r_db = direct_reverb_energy(
                 ir, fs, b_int, gate_ms,
                 late_start_ms_val=late_start_ms_val)
-            rt60 = rt60_per_band.get(b_int)
             R = room_constant(
-                rt60, volume_m3, surface_area_m2)
-
-            if (np.isnan(d_db)
-                    or np.isnan(r_db)
-                    or R is None
-                    or R <= 0
+                rt60_per_band.get(b_int),
+                volume_m3, surface_area_m2)
+            if (np.isnan(d_db) or np.isnan(r_db)
+                    or R is None or R <= 0
                     or listener_distance_m <= 0):
                 continue
-
             D_over_R = 10.0 ** ((d_db - r_db) / 10.0)
-            Q = ((16.0 * np.pi * listener_distance_m ** 2)
+            Q = (16.0 * np.pi * listener_distance_m ** 2
                  / R) * D_over_R
-
             if Q > 0:
                 q_per_band[b_int].append(Q)
-
     di = {}
     for b in bands:
         b_int = int(b)
@@ -832,12 +632,10 @@ def estimate_di_from_multiple_irs(ir_list, fs,
             di[b_int] = np.nan
             continue
         q_median = float(np.median(q_vals))
-        if q_median <= 0:
-            di[b_int] = np.nan
-            continue
-        di[b_int] = float(
-            np.clip(10.0 * np.log10(q_median), 0.0, 20.0))
-
+        di[b_int] = (
+            float(np.clip(
+                10.0 * np.log10(q_median), 0.0, 20.0))
+            if q_median > 0 else np.nan)
     return di
 
 
@@ -847,21 +645,13 @@ def estimate_di_from_multiple_irs(ir_list, fs,
 
 def gated_direct_field(ir, fs, gate_ms=None):
     """
-    Extract the gated direct field magnitude response for EQ
-    use.
-
-    Uses ETC-based reflection detection to set the gate length.
-    Transition frequency rule is 3/T.
-
-    NOTE: The normalisation here (magnitude -= max) is correct
-    for the EQ path only. Do NOT use for DI estimation.
-    Use direct_reverb_energy() for DI which preserves absolute
-    energy ratios.
+    Gated direct field magnitude response for EQ use.
+    Normalised to 0 dB peak — EQ path only.
+    Do NOT use for DI estimation.
     """
     direct_idx = detect_direct_arrival(ir, fs)
     reflection_idx = detect_first_reflection(
         ir, fs, direct_idx)
-
     if gate_ms is None:
         if reflection_idx is not None:
             gap_samples = reflection_idx - direct_idx
@@ -870,53 +660,39 @@ def gated_direct_field(ir, fs, gate_ms=None):
             gate_samples = int(0.020 * fs)
     else:
         gate_samples = int(gate_ms * fs / 1000.0)
-
     gate_samples = max(gate_samples, 16)
     gate_ms_used = gate_samples / fs * 1000.0
-
     ir_gated = ir[
         direct_idx: direct_idx + gate_samples].copy()
-    window = np.hanning(
-        2 * len(ir_gated))[:len(ir_gated)]
+    window = np.hanning(2 * len(ir_gated))[:len(ir_gated)]
     ir_gated *= window
-
-    n_fft = int(
-        2 ** np.ceil(np.log2(max(len(ir_gated), 16))))
+    n_fft = int(2 ** np.ceil(
+        np.log2(max(len(ir_gated), 16))))
     spectrum = np.fft.rfft(ir_gated, n=n_fft)
     freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
     magnitude = 20.0 * np.log10(np.abs(spectrum) + 1e-30)
     magnitude -= np.max(magnitude)
-
     return freqs, magnitude, gate_ms_used
 
 
 def transition_frequency_from_gate(gate_ms_used,
                                     bands=OCTAVE_CENTRES):
     """
-    Derive the transition frequency from the gate length.
-
-    Uses 3/T rather than 2/T. More conservative — reduces the
-    risk of including early reflections in the direct field
-    estimate near the transition frequency.
-
-    Result is snapped to the nearest octave band centre at or
-    above the calculated frequency.
+    Transition frequency from gate length using 3/T rule.
+    Snapped to nearest octave band at or above result.
     """
     gate_s = gate_ms_used / 1000.0
     if gate_s <= 0:
         return 250
-    f_transition = 3.0 / gate_s
-    f_transition = max(f_transition, 125.0)
+    f_transition = max(3.0 / gate_s, 125.0)
     candidates = [b for b in bands if b >= f_transition]
-    if not candidates:
-        return int(bands[-1])
-    return int(min(candidates))
+    return int(min(candidates)) if candidates else int(bands[-1])
 
 
 def direct_field_at_bands(ir, fs, gate_ms=None,
                            bands=OCTAVE_CENTRES):
     """
-    Return the mean direct field level in each octave band.
+    Mean direct field level per octave band.
     dB, normalised — EQ path only.
     """
     freqs, magnitude, gate_ms_used = gated_direct_field(
@@ -938,8 +714,8 @@ def direct_field_at_third_octave_bands(
         ir, fs, gate_ms=None,
         bands=THIRD_OCTAVE_CENTRES):
     """
-    Return the mean direct field level in each 1/3-octave
-    band. dB, normalised — EQ path only.
+    Mean direct field level per 1/3-octave band.
+    dB, normalised — EQ path only.
     """
     freqs, magnitude, gate_ms_used = gated_direct_field(
         ir, fs, gate_ms)
@@ -964,16 +740,14 @@ def spatial_average_reverberant(ir_list, fs,
                                   bands=OCTAVE_CENTRES):
     """
     Spatially averaged reverberant field in octave bands.
-    Averaging in the power domain.
-    Used for spectral shape display only — not for DI.
+    Power domain averaging. Display only — not for DI.
     """
     all_spectra = [reverberant_spectrum(ir, fs, bands)
                    for ir in ir_list]
     averaged = {}
     for b in bands:
         b = int(b)
-        levels_db = [s[b] for s in all_spectra]
-        powers = [10.0 ** (l / 10.0) for l in levels_db]
+        powers = [10.0 ** (s[b] / 10.0) for s in all_spectra]
         averaged[b] = float(
             10.0 * np.log10(np.mean(powers)))
     return averaged
@@ -982,8 +756,8 @@ def spatial_average_reverberant(ir_list, fs,
 def reverberant_spectrum_third_octave(
         ir, fs, bands=THIRD_OCTAVE_CENTRES):
     """
-    Return the Schroeder initial decay level for each
-    1/3-octave band. Filter order reduced to 2 below 80 Hz.
+    Schroeder initial decay level per 1/3-octave band.
+    Filter order 2 below 80 Hz.
     """
     result = {}
     for b in bands:
@@ -993,14 +767,12 @@ def reverberant_spectrum_third_octave(
             ir, fs, f_low, f_high, order=order)
         direct_idx = detect_direct_arrival(
             ir_band, fs, threshold_db=-20)
-        ir_band = ir_band[direct_idx:]
-        margin_db = truncation_margin_for_band(b)
         ir_band = truncate_to_noise_floor(
-            ir_band, margin_db=margin_db)
+            ir_band[direct_idx:],
+            margin_db=truncation_margin_for_band(b))
         decay_db = schroeder_decay(ir_band)
         n_avg = max(1, int(0.005 * fs))
-        result[float(b)] = float(
-            np.mean(decay_db[:n_avg]))
+        result[float(b)] = float(np.mean(decay_db[:n_avg]))
     return result
 
 
@@ -1008,7 +780,7 @@ def spatial_average_reverberant_third_octave(
         ir_list, fs, bands=THIRD_OCTAVE_CENTRES):
     """
     Spatially averaged reverberant field in 1/3-octave bands.
-    Averaging in the power domain.
+    Power domain averaging.
     """
     all_spectra = [
         reverberant_spectrum_third_octave(ir, fs, bands)
@@ -1016,27 +788,169 @@ def spatial_average_reverberant_third_octave(
     averaged = {}
     for b in bands:
         b = float(b)
-        levels_db = [s[b] for s in all_spectra]
-        powers = [10.0 ** (l / 10.0) for l in levels_db]
+        powers = [10.0 ** (s[b] / 10.0) for s in all_spectra]
         averaged[b] = float(
             10.0 * np.log10(np.mean(powers)))
     return averaged
 
 
 # ---------------------------------------------------------------------------
-# EQ target derivation
+# Target response generators
+# ---------------------------------------------------------------------------
+
+TARGET_TYPES = [
+    'Flat Direct Field',
+    'X-Curve (Large Room)',
+    'X-Curve (Small Room)',
+    'SMPTE ST 422',
+]
+
+
+def flat_target(bands=THIRD_OCTAVE_CENTRES):
+    """
+    Flat target: 0 dB at all bands.
+    Returns dict {centre_hz: 0.0}.
+    """
+    return {float(b): 0.0 for b in bands}
+
+
+def xcurve_target(freqs_hz, screen_size='large'):
+    """
+    X-curve target levels.
+
+    Large room (SMPTE ST 202M / ISO 2969):
+      Flat to 2 kHz, -3 dB/octave above,
+      -3 dB/octave below 63 Hz.
+
+    Small room (SMPTE RP 200):
+      Flat to 4 kHz, -3 dB/octave above,
+      -3 dB/octave below 63 Hz.
+    """
+    freqs = np.asarray(freqs_hz, dtype=float)
+    target = np.zeros_like(freqs)
+    hf_corner = 4000.0 if screen_size == 'small' else 2000.0
+    lf_corner = 63.0
+    for i, f in enumerate(freqs):
+        if f <= 0:
+            target[i] = np.nan
+            continue
+        level = 0.0
+        if f > hf_corner:
+            level -= 3.0 * np.log2(f / hf_corner)
+        if f < lf_corner:
+            level -= 3.0 * np.log2(lf_corner / f)
+        target[i] = level
+    return target
+
+
+def xcurve_at_third_octave_bands(
+        bands=THIRD_OCTAVE_CENTRES,
+        screen_size='large'):
+    """
+    X-curve target at 1/3-octave band centres.
+    Returns dict {centre_hz: target_db}.
+    """
+    levels = xcurve_target(
+        np.array(bands, dtype=float),
+        screen_size=screen_size)
+    return {float(b): float(l)
+            for b, l in zip(bands, levels)
+            if not np.isnan(l)}
+
+
+def smpte_422_target(freqs_hz):
+    """
+    SMPTE ST 422 target levels.
+
+    Flat to 2 kHz.
+    -1.5 dB/octave above 2 kHz.
+    No LF tilt.
+
+    Returns array of target levels in dB.
+    """
+    freqs = np.asarray(freqs_hz, dtype=float)
+    target = np.zeros_like(freqs)
+    hf_corner = 2000.0
+    for i, f in enumerate(freqs):
+        if f <= 0:
+            target[i] = np.nan
+            continue
+        level = 0.0
+        if f > hf_corner:
+            level -= 1.5 * np.log2(f / hf_corner)
+        target[i] = level
+    return target
+
+
+def smpte_422_at_third_octave_bands(
+        bands=THIRD_OCTAVE_CENTRES):
+    """
+    SMPTE ST 422 target at 1/3-octave band centres.
+    Returns dict {centre_hz: target_db}.
+    """
+    levels = smpte_422_target(
+        np.array(bands, dtype=float))
+    return {float(b): float(l)
+            for b, l in zip(bands, levels)
+            if not np.isnan(l)}
+
+
+def get_target_levels(target_type,
+                      bands=THIRD_OCTAVE_CENTRES):
+    """
+    Return target levels dict for the given target_type.
+
+    target_type must be one of TARGET_TYPES:
+      'Flat Direct Field'
+      'X-Curve (Large Room)'
+      'X-Curve (Small Room)'
+      'SMPTE ST 422'
+    """
+    if target_type == 'X-Curve (Large Room)':
+        return xcurve_at_third_octave_bands(
+            bands, screen_size='large')
+    elif target_type == 'X-Curve (Small Room)':
+        return xcurve_at_third_octave_bands(
+            bands, screen_size='small')
+    elif target_type == 'SMPTE ST 422':
+        return smpte_422_at_third_octave_bands(bands)
+    else:
+        return flat_target(bands)
+
+
+def get_target_levels_octave(target_type,
+                              bands=OCTAVE_CENTRES):
+    """
+    Return target levels dict at octave band resolution.
+    """
+    return get_target_levels(target_type, bands=bands)
+
+
+# ---------------------------------------------------------------------------
+# EQ target derivation — target-aware
 # ---------------------------------------------------------------------------
 
 def derive_direct_field_target(direct_levels,
                                 bands=OCTAVE_CENTRES,
                                 ref_band=1000,
                                 hf_shelf_hz=10000,
-                                hf_shelf_db=0.0):
+                                hf_shelf_db=0.0,
+                                target_type='Flat Direct Field'):
     """
-    Derive the direct field EQ correction per octave band.
-    Target is flat (0 dB) relative to the reference band.
+    Derive direct field EQ correction per octave band
+    relative to the selected target.
+
+    Correction = target_level - measured_level
+    (normalised relative to ref_band at 1 kHz)
+
+    For Flat Direct Field this is identical to the
+    previous behaviour. For other targets the correction
+    is adjusted so the post-EQ response matches the
+    selected target shape.
     """
     ref = direct_levels.get(ref_band, 0.0) or 0.0
+    target_oct = get_target_levels_octave(
+        target_type, bands=bands)
     corrections = {}
     for b in [int(b) for b in bands]:
         level = direct_levels.get(b, np.nan)
@@ -1044,7 +958,8 @@ def derive_direct_field_target(direct_levels,
             corrections[b] = np.nan
             continue
         normalised = level - ref
-        correction = -normalised
+        target_level = target_oct.get(float(b), 0.0)
+        correction = target_level - normalised
         if b >= hf_shelf_hz and hf_shelf_db != 0.0:
             correction += hf_shelf_db
         corrections[b] = round(correction, 2)
@@ -1058,13 +973,13 @@ def apply_correction_constraints(corrections,
                                   max_cut_db=12.0,
                                   min_band_hz=250):
     """
-    Apply engineering constraints to the raw correction values.
+    Apply engineering constraints to raw corrections.
 
     Constraints:
       - Bands below min_band_hz set to zero
       - Clipped to [-max_cut_db, +max_boost_db]
-      - Boost suppressed where reverberant level is elevated
-        relative to neighbours
+      - Boost suppressed where reverberant level is
+        elevated relative to neighbours
     """
     constrained = {}
     for b, corr in corrections.items():
@@ -1086,9 +1001,7 @@ def apply_correction_constraints(corrections,
                         bands_list[idx - 1], r)
                     r_above = reverberant_levels.get(
                         bands_list[idx + 1], r)
-                    r_neighbours = (
-                        (r_below + r_above) / 2.0)
-                    if r > r_neighbours + 2.0:
+                    if r > (r_below + r_above) / 2.0 + 2.0:
                         corr = min(corr, 0.0)
         constrained[b] = round(corr, 2)
     return constrained
@@ -1100,16 +1013,15 @@ def lf_correction_from_spatial_average(
         ref_band=250,
         max_correction_db=6.0):
     """
-    Derive broad LF corrections from the spatially averaged
-    steady-state below the transition frequency.
+    Broad LF corrections from spatially averaged steady-state
+    below the transition frequency.
     """
     bands = sorted(k for k in spatial_avg_levels
                    if k <= transition_hz)
     if not bands:
         return {}
     ref = spatial_avg_levels.get(
-        ref_band,
-        spatial_avg_levels.get(bands[-1], 0.0))
+        ref_band, spatial_avg_levels.get(bands[-1], 0.0))
     corrections = {}
     for b in bands:
         level = spatial_avg_levels.get(b, np.nan)
@@ -1127,9 +1039,14 @@ def derive_full_eq_target(direct_levels,
                            reverberant_levels,
                            spatial_avg_levels,
                            channel_cfg,
-                           transition_hz=250):
+                           transition_hz=250,
+                           target_type='Flat Direct Field'):
     """
     Full EQ target derivation for one channel.
+
+    target_type selects the monitoring target against which
+    corrections are calculated.
+
     Returns hf_corrections, lf_corrections, all_corrections.
     """
     hf_shelf_db = channel_cfg.get('hf_shelf_db', 0.0)
@@ -1138,7 +1055,8 @@ def derive_full_eq_target(direct_levels,
     raw_corrections = derive_direct_field_target(
         direct_levels,
         hf_shelf_hz=hf_shelf_hz,
-        hf_shelf_db=hf_shelf_db)
+        hf_shelf_db=hf_shelf_db,
+        target_type=target_type)
 
     hf_corrections = apply_correction_constraints(
         raw_corrections, direct_levels, reverberant_levels)
@@ -1157,33 +1075,24 @@ def derive_full_eq_target(direct_levels,
 
 def smooth_third_octave(levels_dict, fraction=3):
     """
-    Apply 1/N-octave smoothing to a dict of
-    {freq: level_db}.
-
-    fraction=3 gives 1/3-octave smoothing.
-    fraction=6 gives 1/6-octave smoothing.
-
-    Averaging in the power domain.
+    1/N-octave smoothing. Power domain averaging.
+    fraction=3: 1/3-octave. fraction=6: 1/6-octave.
     """
     bands = sorted(levels_dict.keys())
     if len(bands) < 3:
         return levels_dict
-
     freqs = np.array(bands, dtype=float)
     levels = np.array([levels_dict[b] for b in bands])
     smoothed = np.zeros_like(levels)
-
     for i, f in enumerate(freqs):
         f_lo = f / (2.0 ** (1.0 / (2.0 * fraction)))
         f_hi = f * (2.0 ** (1.0 / (2.0 * fraction)))
         mask = (freqs >= f_lo) & (freqs <= f_hi)
         if mask.sum() > 0:
             power = 10.0 ** (levels[mask] / 10.0)
-            smoothed[i] = 10.0 * np.log10(
-                np.mean(power))
+            smoothed[i] = 10.0 * np.log10(np.mean(power))
         else:
             smoothed[i] = levels[i]
-
     return {float(b): float(v)
             for b, v in zip(bands, smoothed)}
 
@@ -1200,70 +1109,57 @@ def predict_post_eq_steady_state_third_octave(
         transition_hz=250,
         half_octave_overlap=True):
     """
-    Predict the steady-state response in 1/3-octave bands
-    after applying octave band EQ corrections.
+    Predict steady-state response after EQ in 1/3-octave bands.
 
-    Implements the half-octave transition splice:
-      Above transition:  1/6-octave smoothing on direct field
-      Below transition:  1/3-octave smoothing
-      Splice region:     half-octave overlap with power-domain
-                         crossfade
+    Half-octave transition splice:
+      Above: 1/6-octave smoothed direct field
+      Below: 1/3-octave smoothed direct field
+      Splice: power-domain crossfade over half octave
     """
     oct_bands = sorted(all_corrections_octave.keys())
-    oct_corr = [
-        all_corrections_octave[b] for b in oct_bands]
+    oct_corr = [all_corrections_octave[b]
+                for b in oct_bands]
     band_floats = [float(b) for b in bands]
-    log_oct = np.log10([float(b) for b in oct_bands])
-    log_third = np.log10(band_floats)
     interp_corr = np.interp(
-        log_third, log_oct, oct_corr,
+        np.log10(band_floats),
+        np.log10([float(b) for b in oct_bands]),
+        oct_corr,
         left=oct_corr[0], right=oct_corr[-1])
 
-    direct_smoothed_hf = smooth_third_octave(
+    direct_hf = smooth_third_octave(
         direct_levels_3rd, fraction=6)
-    direct_smoothed_lf = smooth_third_octave(
+    direct_lf = smooth_third_octave(
         direct_levels_3rd, fraction=3)
-
-    splice_lo = transition_hz / (2.0 ** (1.0 / 2.0))
-    splice_hi = transition_hz * (2.0 ** (1.0 / 2.0))
+    splice_lo = transition_hz / (2.0 ** 0.5)
+    splice_hi = transition_hz * (2.0 ** 0.5)
 
     predicted = {}
     for i, b in enumerate(band_floats):
         c = float(interp_corr[i])
-
         if half_octave_overlap and splice_lo < b < splice_hi:
-            weight = (
-                (np.log10(b) - np.log10(splice_lo)) /
-                (np.log10(splice_hi)
-                 - np.log10(splice_lo)))
-            d_hf = direct_smoothed_hf.get(b, np.nan)
-            d_lf = direct_smoothed_lf.get(b, np.nan)
+            w = ((np.log10(b) - np.log10(splice_lo))
+                 / (np.log10(splice_hi)
+                    - np.log10(splice_lo)))
+            d_hf = direct_hf.get(b, np.nan)
+            d_lf = direct_lf.get(b, np.nan)
             if np.isnan(d_hf) or np.isnan(d_lf):
                 d = direct_levels_3rd.get(b, np.nan)
             else:
-                p_hf = 10.0 ** (d_hf / 10.0)
-                p_lf = 10.0 ** (d_lf / 10.0)
                 d = 10.0 * np.log10(
-                    (1.0 - weight) * p_lf
-                    + weight * p_hf)
+                    (1.0 - w) * 10.0 ** (d_lf / 10.0)
+                    + w * 10.0 ** (d_hf / 10.0))
         elif b >= transition_hz:
-            d = direct_smoothed_hf.get(b, np.nan)
+            d = direct_hf.get(b, np.nan)
         else:
-            d = direct_smoothed_lf.get(b, np.nan)
-
+            d = direct_lf.get(b, np.nan)
         r = reverberant_levels_3rd.get(b, np.nan)
-
         if np.isnan(d) or np.isnan(r):
             predicted[b] = np.nan
             continue
-
-        d_eq = d + c
-        r_eq = r + c
         ss = 10.0 * np.log10(
-            10.0 ** (d_eq / 10.0)
-            + 10.0 ** (r_eq / 10.0))
+            10.0 ** ((d + c) / 10.0)
+            + 10.0 ** ((r + c) / 10.0))
         predicted[b] = round(ss, 2)
-
     return predicted
 
 
@@ -1276,99 +1172,143 @@ def reconstruct_steady_state(
         reverberant_levels_3rd,
         bands=THIRD_OCTAVE_CENTRES):
     """
-    Reconstruct the steady-state response by energy-summing
-    the measured direct and reverberant fields.
+    Reconstruct steady-state by energy-summing measured fields.
 
-    This is a reconstruction from measurements, not an
-    independent physics-based prediction. It answers:
-    "Given what we measured, what would a steady-state
-    pink noise measurement show?"
+    This is a reconstruction, not an independent prediction.
 
     Returns:
-      reconstructed dict {centre_hz: level_db}
-      tolerance_upper dict {centre_hz: level_db}
-      tolerance_lower dict {centre_hz: level_db}
-
-    Tolerance bands:
-      +/-2 dB from 100 Hz to 8 kHz
-      +/-3 dB below 100 Hz and above 8 kHz
+      reconstructed, tolerance_upper, tolerance_lower
+      all dicts {centre_hz: level_db}
     """
     band_floats = [float(b) for b in bands]
     reconstructed = {}
     tolerance_upper = {}
     tolerance_lower = {}
-
     for b in band_floats:
         d = direct_levels_3rd.get(b, np.nan)
         r = reverberant_levels_3rd.get(b, np.nan)
-
         if np.isnan(d) or np.isnan(r):
             reconstructed[b] = np.nan
             tolerance_upper[b] = np.nan
             tolerance_lower[b] = np.nan
             continue
-
         ss = 10.0 * np.log10(
             10.0 ** (d / 10.0) + 10.0 ** (r / 10.0))
-
         reconstructed[b] = round(ss, 2)
         tol = 2.0 if 100.0 <= b <= 8000.0 else 3.0
         tolerance_upper[b] = round(ss + tol, 2)
         tolerance_lower[b] = round(ss - tol, 2)
-
     return reconstructed, tolerance_upper, tolerance_lower
 
 
 # ---------------------------------------------------------------------------
-# X-curve target (SMPTE ST 202M / ISO 2969)
+# Parametric EQ filter generation
 # ---------------------------------------------------------------------------
 
-def xcurve_target(freqs_hz, screen_size='large'):
+def generate_parametric_eq(all_corrections_octave,
+                            max_filters=10):
     """
-    Generate the X-curve target level at each frequency.
+    Generate parametric EQ filter recommendations from
+    octave band corrections.
 
-    Standard X-curve (large rooms, SMPTE ST 202M):
-      Flat to 2 kHz, -3 dB/octave above,
-      -3 dB/octave below 63 Hz.
+    Strategy:
+      1. Ignore bands with correction near zero
+         (threshold 0.5 dB).
+      2. Collapse adjacent bands with similar corrections
+         into a single broad filter.
+      3. Map remaining features to PEQ bell, high shelf,
+         or low shelf as appropriate.
+      4. Limit output to max_filters filters.
 
-    Modified X-curve (small rooms, SMPTE RP 200):
-      Flat to 4 kHz, -3 dB/octave above,
-      -3 dB/octave below 63 Hz.
+    Filter fields:
+      number        int
+      type          'Bell', 'High Shelf', 'Low Shelf'
+      frequency_hz  float
+      gain_db       float
+      q             float
+
+    Returns list of filter dicts.
     """
-    freqs = np.asarray(freqs_hz, dtype=float)
-    target = np.zeros_like(freqs)
-    hf_corner = 4000.0 if screen_size == 'small' else 2000.0
-    lf_corner = 63.0
+    bands = sorted(
+        b for b in all_corrections_octave.keys()
+        if isinstance(b, int))
+    corrections = [all_corrections_octave[b]
+                   for b in bands]
 
-    for i, f in enumerate(freqs):
-        if f <= 0:
-            target[i] = np.nan
-            continue
-        level = 0.0
-        if f > hf_corner:
-            octaves_above = np.log2(f / hf_corner)
-            level -= 3.0 * octaves_above
-        if f < lf_corner:
-            octaves_below = np.log2(lf_corner / f)
-            level -= 3.0 * octaves_below
-        target[i] = level
+    # Remove near-zero corrections
+    threshold = 0.5
+    active = [
+        (b, c) for b, c in zip(bands, corrections)
+        if abs(c) >= threshold and not np.isnan(c)]
 
-    return target
+    if not active:
+        return []
 
+    # Collapse adjacent bands with similar corrections
+    # into groups
+    groups = []
+    current_group = [active[0]]
+    for i in range(1, len(active)):
+        prev_b, prev_c = active[i - 1]
+        curr_b, curr_c = active[i]
+        # Adjacent if within one octave step
+        bands_list = list(OCTAVE_CENTRES)
+        prev_idx = (bands_list.index(prev_b)
+                    if prev_b in bands_list else -1)
+        curr_idx = (bands_list.index(curr_b)
+                    if curr_b in bands_list else -1)
+        adjacent = (curr_idx - prev_idx == 1)
+        similar = abs(curr_c - prev_c) <= 1.5
+        if adjacent and similar:
+            current_group.append(active[i])
+        else:
+            groups.append(current_group)
+            current_group = [active[i]]
+    groups.append(current_group)
 
-def xcurve_at_third_octave_bands(
-        bands=THIRD_OCTAVE_CENTRES,
-        screen_size='large'):
-    """
-    Return the X-curve target level at each 1/3-octave band
-    centre. Returns dict {centre_hz: target_db}.
-    """
-    levels = xcurve_target(
-        np.array(bands, dtype=float),
-        screen_size=screen_size)
-    return {float(b): float(l)
-            for b, l in zip(bands, levels)
-            if not np.isnan(l)}
+    filters = []
+    for group in groups:
+        if len(filters) >= max_filters:
+            break
+
+        freqs = [g[0] for g in group]
+        gains = [g[1] for g in group]
+        centre_freq = float(np.exp(
+            np.mean(np.log([float(f) for f in freqs]))))
+        mean_gain = float(np.mean(gains))
+
+        # Determine filter type
+        min_freq = min(freqs)
+        max_freq = max(freqs)
+
+        if min_freq <= 125 and max_freq <= 250:
+            filter_type = 'Low Shelf'
+            freq = float(min_freq)
+            q = 0.707
+        elif min_freq >= 4000:
+            filter_type = 'High Shelf'
+            freq = float(min_freq)
+            q = 0.707
+        else:
+            filter_type = 'Bell'
+            freq = centre_freq
+            # Q depends on number of bands collapsed
+            if len(group) == 1:
+                q = 1.0
+            elif len(group) == 2:
+                q = 0.7
+            else:
+                q = 0.5
+
+        filters.append({
+            'number': len(filters) + 1,
+            'type': filter_type,
+            'frequency_hz': round(freq, 1),
+            'gain_db': round(mean_gain, 1),
+            'q': round(q, 2),
+        })
+
+    return filters
 
 
 # ---------------------------------------------------------------------------
@@ -1380,24 +1320,20 @@ def export_target_for_smaart(target_levels_3rd,
                               output_path,
                               label='EQ Target'):
     """
-    Export a target curve as a two-column CSV importable
-    into Smaart as a reference curve.
+    Export a target curve as Smaart-compatible CSV.
     """
     bands_sorted = sorted(target_levels_3rd.keys())
-    rows = []
-    for b in bands_sorted:
-        level_norm = target_levels_3rd.get(b, np.nan)
-        if np.isnan(level_norm):
-            continue
-        level_abs = level_norm + ref_level_db
-        rows.append((float(b), round(level_abs, 3)))
-
     output_path = Path(output_path)
     with open(output_path, 'w') as f:
         f.write('* ' + label + '\n')
-        for freq, level in rows:
-            f.write(str(freq) + ',' + str(level) + '\n')
-
+        for b in bands_sorted:
+            level_norm = target_levels_3rd.get(b, np.nan)
+            if np.isnan(level_norm):
+                continue
+            level_abs = level_norm + ref_level_db
+            f.write(
+                str(float(b)) + ','
+                + str(round(level_abs, 3)) + '\n')
     return output_path
 
 
@@ -1406,31 +1342,48 @@ def export_xcurve_for_smaart(xcurve_levels_3rd,
                               output_path,
                               screen_size='large'):
     """
-    Export the X-curve target as a Smaart-compatible
-    reference curve CSV.
+    Export X-curve as Smaart-compatible CSV.
     """
     if screen_size == 'large':
         label = ('X-curve target (large room, '
                  'SMPTE ST 202M / ISO 2969)')
     else:
-        label = ('X-curve target (small room, SMPTE RP 200)')
+        label = 'X-curve target (small room, SMPTE RP 200)'
+    return export_target_for_smaart(
+        xcurve_levels_3rd, ref_level_db,
+        output_path, label=label)
 
-    bands_sorted = sorted(xcurve_levels_3rd.keys())
-    rows = []
-    for b in bands_sorted:
-        level_norm = xcurve_levels_3rd.get(b, np.nan)
-        if np.isnan(level_norm):
-            continue
-        level_abs = level_norm + ref_level_db
-        rows.append((float(b), round(level_abs, 3)))
 
-    output_path = Path(output_path)
-    with open(output_path, 'w') as f:
-        f.write('* ' + label + '\n')
-        for freq, level in rows:
-            f.write(str(freq) + ',' + str(level) + '\n')
+def export_selected_target_for_smaart(
+        target_type,
+        target_levels_3rd,
+        ref_level_db,
+        output_path,
+        channel_name=''):
+    """
+    Export the selected monitoring target as a
+    Smaart-compatible reference curve CSV.
 
-    return output_path
+    Filename examples:
+      Left_Flat_Target.txt
+      Left_XCurve_Large_Target.txt
+      Left_XCurve_Small_Target.txt
+      Left_ST422_Target.txt
+    """
+    label_map = {
+        'Flat Direct Field': 'Flat target',
+        'X-Curve (Large Room)':
+            'X-curve large room (SMPTE ST 202M / ISO 2969)',
+        'X-Curve (Small Room)':
+            'X-curve small room (SMPTE RP 200)',
+        'SMPTE ST 422': 'SMPTE ST 422 target',
+    }
+    label = label_map.get(target_type, target_type)
+    if channel_name:
+        label = channel_name + ' — ' + label
+    return export_target_for_smaart(
+        target_levels_3rd, ref_level_db,
+        output_path, label=label)
 
 
 # ---------------------------------------------------------------------------
@@ -1440,26 +1393,63 @@ def export_xcurve_for_smaart(xcurve_levels_3rd,
 def save_csv(direct_levels, reverberant_levels,
              di_estimates, rt60_per_band, all_corrections,
              channel_name, output_dir,
-             bands=OCTAVE_CENTRES):
+             bands=OCTAVE_CENTRES,
+             target_type='Flat Direct Field',
+             predicted_post_eq=None):
     """
     Save full per-band results as CSV.
+
+    Columns:
+      channel, band_hz, target_type,
+      direct_field_db, reverberant_field_db,
+      di_estimate_db,
+      measured_rt60_s, effective_rt60_s, rt60_source,
+      eq_correction_db,
+      predicted_post_eq_db
     """
     bands_int = [int(b) for b in bands]
+    measured_rt60 = rt60_per_band.get('_measured', {})
     rows = []
     for b in bands_int:
+        eff_rt60 = rt60_per_band.get(b)
+        meas_rt60 = measured_rt60.get(b)
+
+        # Determine RT60 source
+        if eff_rt60 is None:
+            rt60_source = 'None'
+        elif (meas_rt60 is not None
+              and abs(eff_rt60 - meas_rt60) < 0.001):
+            rt60_source = 'Measured'
+        elif meas_rt60 is None:
+            rt60_source = 'Manual Override'
+        else:
+            rt60_source = 'HF Fallback'
+
+        post_eq_db = np.nan
+        if predicted_post_eq is not None:
+            post_eq_db = predicted_post_eq.get(
+                float(b), np.nan)
+
         rows.append({
             'channel': channel_name,
             'band_hz': b,
+            'target_type': target_type,
             'direct_field_db': round(
                 direct_levels.get(b, np.nan), 2),
             'reverberant_field_db': round(
                 reverberant_levels.get(b, np.nan), 2),
             'di_estimate_db': round(
                 di_estimates.get(b, np.nan), 2),
-            'rt60_s': round(
-                rt60_per_band.get(b) or np.nan, 3),
+            'measured_rt60_s': round(
+                meas_rt60 or np.nan, 3),
+            'effective_rt60_s': round(
+                eff_rt60 or np.nan, 3),
+            'rt60_source': rt60_source,
             'eq_correction_db': round(
                 all_corrections.get(b, 0.0), 2),
+            'predicted_post_eq_db': round(
+                post_eq_db, 2)
+            if not np.isnan(post_eq_db) else np.nan,
         })
     df = pd.DataFrame(rows)
     out_path = (Path(output_dir)
@@ -1476,17 +1466,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Reverberant field analysis and EQ '
                     'target derivation')
-    parser.add_argument('--config', required=True,
-                        help='Path to room_config.yaml')
-    parser.add_argument('--session', required=True,
-                        help='Directory containing IR WAV '
-                             'files')
-    parser.add_argument('--output', default='output',
-                        help='Directory for outputs')
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--session', required=True)
+    parser.add_argument('--output', default='output')
     args = parser.parse_args()
-
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-
     print("Use the Streamlit app for interactive analysis.")
     print("Command line mode outputs CSV only.")
