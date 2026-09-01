@@ -35,6 +35,8 @@ from di_analysis import (
     validate_rt60,
     room_constant,
     room_constant_formula_used,
+    mixing_time_ms,
+    late_start_ms,
     OCTAVE_CENTRES,
     THIRD_OCTAVE_CENTRES,
 )
@@ -72,16 +74,31 @@ surface = 2.0 * (
     room_length * room_height +
     room_width * room_height)
 
-st.sidebar.metric("Volume (m3)", f"{volume:.1f}")
-st.sidebar.metric("Surface area (m2)", f"{surface:.1f}")
+st.sidebar.metric("Volume (m3)", str(round(volume, 1)))
+st.sidebar.metric("Surface area (m2)", str(round(surface, 1)))
 
 listener_distance_m = room_length * (2.0 / 3.0)
 st.sidebar.metric(
     "Listener distance (m)",
-    f"{listener_distance_m:.1f}",
+    str(round(listener_distance_m, 1)),
     help=(
         "Estimated as 2/3 of room length. Used for "
         "DI estimation via classical D/R inversion."))
+
+t_mix = mixing_time_ms(volume)
+late_start = late_start_ms(volume)
+st.sidebar.metric(
+    "Mixing time estimate (ms)",
+    str(round(t_mix, 1)),
+    help=(
+        "Polack approximation: 0.0117 * V^(1/3). "
+        "Late energy window starts at max(50 ms, mixing time)."))
+st.sidebar.metric(
+    "Late energy window start (ms)",
+    str(round(late_start, 1)),
+    help=(
+        "Late energy window start used for DI estimation. "
+        "max(50 ms floor, Polack mixing time estimate)."))
 
 st.sidebar.subheader("Measurement Settings")
 
@@ -147,9 +164,9 @@ if uploaded_files:
             "field only."))
     st.caption(
         "Direct field will be measured from: "
-        "**" + ref_filename + "**. "
-        "All uploaded files contribute to the reverberant "
-        "field spatial average and RT60 estimation.")
+        + "**" + ref_filename + "**. "
+        + "All uploaded files contribute to the reverberant "
+        + "field spatial average and RT60 estimation.")
 
 # ---------------------------------------------------------------------------
 # RT60 overrides
@@ -279,6 +296,19 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             irs, ref_fs)
 
         # -----------------------------------------------------------
+        # Late energy window — derived from room volume
+        # -----------------------------------------------------------
+
+        late_start_val = late_start_ms(volume)
+
+        st.info(
+            "Late energy window start: "
+            + str(round(late_start_val, 1))
+            + " ms (Polack mixing time estimate "
+            + str(round(mixing_time_ms(volume), 1))
+            + " ms, 50 ms floor applied)")
+
+        # -----------------------------------------------------------
         # DI estimation — absolute energy path
         # -----------------------------------------------------------
 
@@ -289,7 +319,7 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             surface_area_m2=surface,
             listener_distance_m=listener_distance_m,
             gate_ms=gate_ms_used,
-            late_start_ms=50.0)
+            late_start_ms_val=late_start_val)
 
         # -----------------------------------------------------------
         # EQ corrections
@@ -430,6 +460,7 @@ if uploaded_files and ref_filename and st.button("Run Analysis"):
             'listener_distance_m': listener_distance_m,
             'volume': volume,
             'surface': surface,
+            'late_start_val': late_start_val,
             'analysis_complete': True,
         })
 
@@ -448,418 +479,4 @@ if st.session_state.get('analysis_complete'):
     rt60_warnings = st.session_state['rt60_warnings']
     di = st.session_state['di']
     gate_ms_used = st.session_state['gate_ms_used']
-    transition_hz = st.session_state['transition_hz']
-    df = st.session_state['df']
-    eq_target_path = Path(st.session_state['eq_target_path'])
-    xcurve_large_path = Path(
-        st.session_state['xcurve_large_path'])
-    xcurve_small_path = Path(
-        st.session_state['xcurve_small_path'])
-    ref_filename = st.session_state['ref_filename']
-    n_irs = st.session_state['n_irs']
-    listener_distance_m = st.session_state[
-        'listener_distance_m']
-    volume = st.session_state['volume']
-    surface = st.session_state['surface']
-
-    # ---------------------------------------------------------------
-    # RT60 warnings
-    # ---------------------------------------------------------------
-
-    if rt60_warnings:
-        st.warning("RT60 validation warnings:")
-        for band, msg in rt60_warnings.items():
-            st.write("  **" + str(band) + ":** " + msg)
-
-    # ---------------------------------------------------------------
-    # Helper: build Plotly trace
-    # ---------------------------------------------------------------
-
-    def make_trace(levels_dict, name, colour,
-                   dash='solid', width=2, opacity=1.0):
-        if not levels_dict:
-            return go.Scatter(
-                x=[], y=[], name=name,
-                line=dict(color=colour))
-        bands_sorted = sorted(levels_dict.keys())
-        x = [float(b) for b in bands_sorted]
-        y = [float(levels_dict[b]) for b in bands_sorted]
-        return go.Scatter(
-            x=x, y=y,
-            mode='lines+markers',
-            name=name,
-            line=dict(color=colour, dash=dash, width=width),
-            marker=dict(size=4),
-            opacity=opacity)
-
-    # ---------------------------------------------------------------
-    # Main response plot
-    # ---------------------------------------------------------------
-
-    st.header("2. Measured Response and Predicted Room Curve")
-
-    with st.expander("Plot controls", expanded=True):
-
-        st.markdown("**Trace visibility**")
-
-        vis_col1, vis_col2, vis_col3, vis_col4, vis_col5 = \
-            st.columns(5)
-        with vis_col1:
-            show_direct = st.checkbox(
-                "Direct field", value=True,
-                key='show_direct')
-        with vis_col2:
-            show_reverb = st.checkbox(
-                "Reverberant field", value=True,
-                key='show_reverb')
-        with vis_col3:
-            show_room_curve = st.checkbox(
-                "Predicted room curve", value=True,
-                key='show_room_curve')
-        with vis_col4:
-            show_xcurve_large = st.checkbox(
-                "X-curve (large room)", value=True,
-                key='show_xcurve_large')
-        with vis_col5:
-            show_xcurve_small = st.checkbox(
-                "X-curve (small room)", value=False,
-                key='show_xcurve_small')
-
-        st.markdown("**Trace level offsets (dB)**")
-        st.caption(
-            "Display-only. Does not affect EQ corrections "
-            "or exported files.")
-
-        off_col1, off_col2, off_col3 = st.columns(3)
-        with off_col1:
-            direct_offset = st.slider(
-                "Direct field offset (dB)",
-                min_value=-20.0, max_value=20.0,
-                value=0.0, step=0.5,
-                key='direct_offset')
-        with off_col2:
-            reverb_offset = st.slider(
-                "Reverberant field offset (dB)",
-                min_value=-20.0, max_value=20.0,
-                value=0.0, step=0.5,
-                key='reverb_offset')
-        with off_col3:
-            room_curve_offset = st.slider(
-                "Predicted room curve offset (dB)",
-                min_value=-20.0, max_value=20.0,
-                value=0.0, step=0.5,
-                key='room_curve_offset')
-
-    direct_display = {
-        b: v + direct_offset
-        for b, v in direct_3rd_norm.items()}
-    reverb_display = {
-        b: v + reverb_offset
-        for b, v in reverb_3rd_norm.items()}
-    room_curve_display = {
-        b: v + room_curve_offset
-        for b, v in room_curve_norm.items()}
-
-    fig_main = go.Figure()
-
-    if show_direct:
-        label = "Direct field (gated, 1/3 oct)"
-        if direct_offset != 0.0:
-            label += "  " + (
-                "+" if direct_offset > 0 else "") \
-                + str(round(direct_offset, 1)) + " dB"
-        fig_main.add_trace(make_trace(
-            direct_display, label, 'steelblue', width=2))
-
-    if show_reverb:
-        label = "Reverberant field (spatially averaged)"
-        if reverb_offset != 0.0:
-            label += "  " + (
-                "+" if reverb_offset > 0 else "") \
-                + str(round(reverb_offset, 1)) + " dB"
-        fig_main.add_trace(make_trace(
-            reverb_display, label, 'firebrick',
-            dash='dash', width=1.5, opacity=0.7))
-
-    if show_room_curve:
-        label = "Predicted room curve (direct + reverberant)"
-        if room_curve_offset != 0.0:
-            label += "  " + (
-                "+" if room_curve_offset > 0 else "") \
-                + str(round(room_curve_offset, 1)) + " dB"
-        fig_main.add_trace(make_trace(
-            room_curve_display, label, 'grey',
-            dash='solid', width=2, opacity=0.9))
-
-    if show_xcurve_large:
-        fig_main.add_trace(make_trace(
-            xcurve_large,
-            'X-curve (large room, SMPTE ST 202M / ISO 2969)',
-            'purple', dash='dashdot', width=2))
-
-    if show_xcurve_small:
-        fig_main.add_trace(make_trace(
-            xcurve_small,
-            'X-curve (small room, SMPTE RP 200)',
-            'darkorchid', dash='dot', width=2))
-
-    fig_main.update_layout(
-        title=(
-            channel_name + " — " + room_name
-            + " — Measured Response and Predicted Room Curve"
-            + " (1/3 octave bands)"),
-        xaxis=dict(
-            title='Frequency (Hz)',
-            type='log',
-            tickvals=[
-                20, 31.5, 63, 125, 250, 500,
-                1000, 2000, 4000, 8000, 16000],
-            ticktext=[
-                '20', '31.5', '63', '125', '250', '500',
-                '1k', '2k', '4k', '8k', '16k'],
-            range=[np.log10(20), np.log10(20000)]),
-        yaxis=dict(
-            title='Level (dB, normalised at 1 kHz)',
-            range=[-25, 15]),
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=-0.35,
-            xanchor='left',
-            x=0),
-        height=560,
-        hovermode='x unified')
-
-    st.plotly_chart(fig_main, width='stretch')
-
-    st.caption(
-        "Direct field: gated IR at reference position ("
-        + ref_filename + "), 1/6-octave smoothed above "
-        "transition frequency. "
-        "Reverberant field: spatially averaged Schroeder "
-        "decay across all positions. "
-        "Predicted room curve: energy sum of direct and "
-        "reverberant fields with no EQ applied. "
-        "X-curve large room: flat to 2 kHz, -3 dB/octave "
-        "above, -3 dB/octave below 63 Hz (SMPTE ST 202M). "
-        "X-curve small room: flat to 4 kHz (SMPTE RP 200). "
-        "All traces normalised to 0 dB at 1 kHz. "
-        "Offsets are display-only.")
-
-    # ---------------------------------------------------------------
-    # RT60 plot
-    # ---------------------------------------------------------------
-
-    st.header("3. RT60 and Directivity Index")
-
-    fig_rt60 = go.Figure()
-
-    rt60_bands_sorted = sorted(
-        b for b in rt60_bands
-        if isinstance(b, int)
-        and rt60_bands[b] is not None)
-    rt60_vals = [rt60_bands[b] for b in rt60_bands_sorted]
-
-    fig_rt60.add_trace(go.Scatter(
-        x=[float(b) for b in rt60_bands_sorted],
-        y=rt60_vals,
-        mode='lines+markers',
-        name='RT60 (s)',
-        line=dict(color='mediumseagreen', width=2),
-        marker=dict(size=8)))
-
-    fig_rt60.update_layout(
-        title='RT60 per Octave Band',
-        xaxis=dict(
-            title='Frequency (Hz)',
-            type='log',
-            tickvals=[63, 125, 250, 500, 1000,
-                      2000, 4000, 8000, 16000],
-            ticktext=['63', '125', '250', '500', '1k',
-                      '2k', '4k', '8k', '16k']),
-        yaxis=dict(
-            title='RT60 (s)',
-            rangemode='tozero'),
-        height=350,
-        hovermode='x unified')
-
-    st.plotly_chart(fig_rt60, width='stretch')
-
-    formula_rows = []
-    for b in [63, 125, 250, 500, 1000,
-              2000, 4000, 8000, 16000]:
-        rt60 = rt60_bands.get(b)
-        if rt60 is not None:
-            formula = room_constant_formula_used(
-                rt60, volume, surface)
-            formula_rows.append({
-                'Band (Hz)': b,
-                'RT60 (s)': round(rt60, 3),
-                'R formula': formula})
-
-    if formula_rows:
-        with st.expander(
-                "Room constant formula used per band",
-                expanded=False):
-            st.dataframe(
-                pd.DataFrame(formula_rows),
-                hide_index=True)
-            st.caption(
-                "Sabine used when mean absorption alpha <= 0.2. "
-                "Eyring used when alpha > 0.2. "
-                "Eyring is more accurate for treated rooms "
-                "with high absorption.")
-
-    # ---------------------------------------------------------------
-    # DI plot
-    # ---------------------------------------------------------------
-
-    fig_di = go.Figure()
-
-    di_sorted = sorted(
-        b for b in di
-        if not np.isnan(di.get(b, np.nan)))
-    di_vals = [di[b] for b in di_sorted]
-
-    fig_di.add_trace(go.Scatter(
-        x=[float(b) for b in di_sorted],
-        y=di_vals,
-        mode='lines+markers',
-        name='DI estimate (dB)',
-        line=dict(color='mediumpurple', width=2),
-        marker=dict(size=8)))
-
-    fig_di.update_layout(
-        title=(
-            "Estimated Directivity Index DI(f) — "
-            "listener distance "
-            + str(round(listener_distance_m, 1))
-            + " m (2/3 room length)"),
-        xaxis=dict(
-            title='Frequency (Hz)',
-            type='log',
-            tickvals=[63, 125, 250, 500, 1000,
-                      2000, 4000, 8000, 16000],
-            ticktext=['63', '125', '250', '500', '1k',
-                      '2k', '4k', '8k', '16k']),
-        yaxis=dict(
-            title='DI (dB)',
-            range=[0, 22]),
-        height=350,
-        hovermode='x unified')
-
-    st.plotly_chart(fig_di, width='stretch')
-
-    st.caption(
-        "DI estimated from classical D/R inversion: "
-        "Q = (16 x pi x r^2 / R) x (D/R), "
-        "DI = 10 log10(Q). "
-        "Median Q across all measurement positions. "
-        "Room constant R uses Sabine (alpha <= 0.2) "
-        "or Eyring (alpha > 0.2). "
-        "DI clipped to [0, 20] dB.")
-
-    # ---------------------------------------------------------------
-    # Summary metrics
-    # ---------------------------------------------------------------
-
-    st.header("4. Measurement Summary")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Gate length",
-                  str(round(gate_ms_used, 1)) + " ms")
-    with col2:
-        st.metric("Transition frequency",
-                  str(transition_hz) + " Hz")
-    with col3:
-        st.metric("IR files processed", n_irs)
-    with col4:
-        valid_rt60 = [
-            v for k, v in rt60_bands.items()
-            if isinstance(k, int) and v is not None]
-        avg_rt60 = np.mean(valid_rt60) if valid_rt60 else 0.0
-        st.metric("Mean RT60",
-                  str(round(avg_rt60, 2)) + " s")
-
-    st.caption(
-        "Reference position: " + ref_filename
-        + " (used for direct field measurement). "
-        "All " + str(n_irs) + " file(s) used for reverberant "
-        "field spatial average and RT60 estimation. "
-        "Listener distance: "
-        + str(round(listener_distance_m, 1))
-        + " m (2/3 of room length).")
-
-    # ---------------------------------------------------------------
-    # Results table
-    # ---------------------------------------------------------------
-
-    st.header("5. Results Table")
-    st.dataframe(df)
-
-    # ---------------------------------------------------------------
-    # Downloads
-    # ---------------------------------------------------------------
-
-    st.header("6. Downloads")
-
-    st.subheader("Smaart Reference Curve Files")
-    st.caption(
-        "Import into Smaart via "
-        "Options -> Reference Curves -> Import. "
-        "All curves are anchored to the measured direct field "
-        "level at 1 kHz.")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    if eq_target_path.exists():
-        with col1:
-            st.download_button(
-                label="EQ target curve (Smaart)",
-                data=eq_target_path.read_bytes(),
-                file_name=eq_target_path.name,
-                mime="text/plain",
-                help=(
-                    "Predicted room curve after EQ applied. "
-                    "Use as a reference curve in Smaart."))
-
-    if xcurve_large_path.exists():
-        with col2:
-            st.download_button(
-                label="X-curve large room (Smaart)",
-                data=xcurve_large_path.read_bytes(),
-                file_name=xcurve_large_path.name,
-                mime="text/plain",
-                help=(
-                    "SMPTE ST 202M / ISO 2969 X-curve. "
-                    "Flat to 2 kHz, -3 dB/octave above."))
-
-    if xcurve_small_path.exists():
-        with col3:
-            st.download_button(
-                label="X-curve small room (Smaart)",
-                data=xcurve_small_path.read_bytes(),
-                file_name=xcurve_small_path.name,
-                mime="text/plain",
-                help=(
-                    "SMPTE RP 200 modified X-curve. "
-                    "Flat to 4 kHz, -3 dB/octave above."))
-
-    csv_path = eq_target_path.parent / (
-        channel_name + "_results.csv")
-    if csv_path.exists():
-        with col4:
-            st.download_button(
-                label="Results CSV",
-                data=csv_path.read_bytes(),
-                file_name=csv_path.name,
-                mime="text/csv",
-                help=(
-                    "Full per-band results including direct "
-                    "field, reverberant field, RT60, DI, "
-                    "and EQ corrections."))
-
-    shutil.rmtree(
-        eq_target_path.parent.parent,
-        ignore_errors=True)
+    transition_hz = st.session_state
