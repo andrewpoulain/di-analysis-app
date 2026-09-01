@@ -7,7 +7,7 @@ Processes IRs exported from Smaart (WAV format) to compute:
   - Gated direct field spectrum at reference position
   - DI estimate from classical D/R inversion
   - EQ correction targets per octave band
-  - Physics-based steady-state prediction and verification
+  - Steady-state reconstruction from measured fields
   - Output plots and CSV report
 
 Usage:
@@ -132,11 +132,6 @@ def compute_etc(ir, fs, smooth_ms=1.0):
     average to reduce noise without obscuring the direct
     arrival onset.
 
-    smooth_ms controls the smoothing window length. A value of
-    1 ms is appropriate for most cinema IRs — short enough to
-    resolve the direct arrival, long enough to suppress noise
-    spikes.
-
     Returns the ETC in dB normalised to 0 dB at peak.
     """
     analytic = sig.hilbert(ir)
@@ -156,9 +151,7 @@ def detect_direct_arrival(ir, fs, threshold_db=-20):
     Find the sample index of the direct arrival using ETC analysis.
 
     Computes the ETC and finds the first sample that exceeds
-    threshold_db relative to the peak. Using the ETC rather than
-    the raw IR prevents noise transients before the direct arrival
-    from being mistaken for the onset.
+    threshold_db relative to the peak.
     """
     etc_db = compute_etc(ir, fs, smooth_ms=0.5)
     candidates = np.where(etc_db >= threshold_db)[0]
@@ -170,11 +163,6 @@ def detect_first_reflection(ir, fs, direct_idx,
     """
     Estimate the arrival time of the first significant reflection
     using ETC analysis.
-
-    Searches for the first local peak in the ETC after the direct
-    arrival that exceeds -20 dB relative to the direct peak.
-    Using the ETC rather than the raw IR avoids false detections
-    from the oscillatory tail of the direct arrival.
 
     Returns sample index or None if not found.
     """
@@ -271,8 +259,7 @@ def schroeder_decay(ir_band):
 def initial_decay_level(ir, fs, centre_hz):
     """
     Return the initial Schroeder decay level for one octave band.
-    Used for reverberant field spectral shape only — not for
-    energy calculations used in DI estimation.
+    Used for reverberant field spectral shape display only.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     order = 2 if centre_hz <= 63 else 4
@@ -291,7 +278,6 @@ def initial_decay_level(ir, fs, centre_hz):
 def reverberant_spectrum(ir, fs, bands=OCTAVE_CENTRES):
     """
     Return the Schroeder initial decay level for each octave band.
-    Returns dict {centre_hz: level_db}.
     Used for spectral shape display only.
     """
     return {int(b): initial_decay_level(ir, fs, b)
@@ -308,19 +294,8 @@ def direct_reverb_energy(ir, fs, centre_hz,
     Calculate true direct and reverberant energies from the
     impulse response in one octave band.
 
-    Direct energy:
-      From direct arrival to gate end.
-
-    Reverberant (late) energy:
-      From late_start_ms onward. Using a fixed late start
-      rather than the Schroeder initial level gives actual
-      reverberant energy rather than the total energy
-      remaining at time zero of the backward integral.
-
-    late_start_ms defaults to 50 ms which is beyond the
-    mixing time in most cinema rooms (typically 20-40 ms).
-    This ensures the late energy measurement captures only
-    the diffuse reverberant field.
+    Direct energy:  direct arrival to gate end.
+    Reverberant:    from late_start_ms onward (default 50 ms).
 
     Returns direct_db, reverb_db (absolute, not normalised).
     These preserve the D/R ratio needed for DI inversion.
@@ -339,15 +314,10 @@ def direct_reverb_energy(ir, fs, centre_hz,
         ir_band[direct_idx:direct_end] ** 2)
     late_energy = np.sum(ir_band[late_start:] ** 2)
 
-    if direct_energy <= 0:
-        direct_db = np.nan
-    else:
-        direct_db = 10.0 * np.log10(direct_energy)
-
-    if late_energy <= 0:
-        reverb_db = np.nan
-    else:
-        reverb_db = 10.0 * np.log10(late_energy)
+    direct_db = (10.0 * np.log10(direct_energy)
+                 if direct_energy > 0 else np.nan)
+    reverb_db = (10.0 * np.log10(late_energy)
+                 if late_energy > 0 else np.nan)
 
     return direct_db, reverb_db
 
@@ -378,12 +348,11 @@ def rt60_from_schroeder(ir, fs, centre_hz):
     """
     Estimate RT60 in one octave band from the Schroeder decay curve.
 
-    Evaluation order is frequency-dependent:
-      Below 8 kHz:  T20 primary, T30 fallback, EDT last resort
-      8 kHz and above: EDT primary, T20 fallback, T30 last resort
+    Below 8 kHz:  T20 primary, T30 fallback, EDT last resort.
+    8 kHz and above: EDT primary, T20 fallback, T30 last resort.
 
-    Filter order is reduced to 2 at 63 Hz and below.
-    Minimum slope threshold is relaxed at high frequencies.
+    Filter order reduced to 2 at 63 Hz and below.
+    Minimum slope threshold relaxed at high frequencies.
     """
     f_low, f_high = octave_band_limits(centre_hz)
     order = 2 if centre_hz <= 63 else 4
@@ -460,11 +429,10 @@ def apply_rt60_hf_fallback(rt60_dict):
     """
     Apply high-frequency RT60 fallback logic.
 
-    Rule 1 — 8 kHz check:
-      If RT60 at 8 kHz < 50% of RT60 at 4 kHz,
+    Rule 1: If RT60 at 8 kHz < 50% of RT60 at 4 kHz,
       replace 8 kHz and 16 kHz with the 4 kHz value.
 
-    Rule 2 — 16 kHz check (only if Rule 1 did not trigger):
+    Rule 2 (only if Rule 1 did not trigger):
       If RT60 at 16 kHz < 50% of RT60 at 8 kHz,
       replace 16 kHz with the 8 kHz value.
 
@@ -479,8 +447,7 @@ def apply_rt60_hf_fallback(rt60_dict):
     if (rt60_4k is not None
             and rt60_8k is not None
             and rt60_4k > 0):
-        ratio_8k = rt60_8k / rt60_4k
-        if ratio_8k < 0.50:
+        if (rt60_8k / rt60_4k) < 0.50:
             warnings.append(
                 f'8 kHz RT60 ({rt60_8k * 1000:.0f} ms) is '
                 f'less than 50% of 4 kHz RT60 '
@@ -492,21 +459,20 @@ def apply_rt60_hf_fallback(rt60_dict):
             corrected[16000] = rt60_4k
             return corrected, warnings
 
-    rt60_8k_current = corrected.get(8000)
-    rt60_16k_current = corrected.get(16000)
+    rt60_8k_c = corrected.get(8000)
+    rt60_16k_c = corrected.get(16000)
 
-    if (rt60_8k_current is not None
-            and rt60_16k_current is not None
-            and rt60_8k_current > 0):
-        ratio_16k = rt60_16k_current / rt60_8k_current
-        if ratio_16k < 0.50:
+    if (rt60_8k_c is not None
+            and rt60_16k_c is not None
+            and rt60_8k_c > 0):
+        if (rt60_16k_c / rt60_8k_c) < 0.50:
             warnings.append(
-                f'16 kHz RT60 ({rt60_16k_current * 1000:.0f} ms) '
+                f'16 kHz RT60 ({rt60_16k_c * 1000:.0f} ms) '
                 f'is less than 50% of 8 kHz RT60 '
-                f'({rt60_8k_current * 1000:.0f} ms) — '
+                f'({rt60_8k_c * 1000:.0f} ms) — '
                 f'substituting 8 kHz value '
-                f'({rt60_8k_current * 1000:.0f} ms) at 16 kHz')
-            corrected[16000] = rt60_8k_current
+                f'({rt60_8k_c * 1000:.0f} ms) at 16 kHz')
+            corrected[16000] = rt60_8k_c
 
     return corrected, warnings
 
@@ -584,19 +550,70 @@ def validate_rt60(rt60_per_band, bands=OCTAVE_CENTRES):
 
 
 # ---------------------------------------------------------------------------
-# Room constant
+# Room constant — Sabine / Eyring hybrid
 # ---------------------------------------------------------------------------
 
 def room_constant(rt60_s, volume_m3, surface_area_m2):
     """
-    Derive the room constant R from RT60 via Sabine inversion.
-    Returns R in m^2, or None if inputs are invalid.
+    Derive the room constant R from RT60.
+
+    Uses Sabine inversion when the mean absorption coefficient
+    α ≤ 0.2 and Eyring inversion when α > 0.2.
+
+    Sabine:
+      α_s = 0.161 * V / (T * S)
+      R   = S * α_s / (1 - α_s)
+
+    Eyring:
+      α_e = 1 - exp(-0.161 * V / (T * S))
+      R   = S * α_e / (1 - α_e)
+
+    Rationale:
+      Sabine's formula assumes a perfectly diffuse field and
+      underestimates absorption when α is large. Eyring's
+      formula is more accurate for α > 0.2, which is common
+      in modern mix rooms with significant acoustic treatment.
+      The threshold of 0.2 is the conventional crossover
+      point in room acoustics literature.
+
+    Returns R in m², or None if inputs are invalid.
     """
     if rt60_s is None or rt60_s <= 0:
         return None
-    alpha = 0.161 * volume_m3 / (rt60_s * surface_area_m2)
-    alpha = min(alpha, 0.999)
-    return surface_area_m2 * alpha / (1.0 - alpha)
+    if surface_area_m2 <= 0 or volume_m3 <= 0:
+        return None
+
+    # Sabine absorption coefficient
+    alpha_sabine = 0.161 * volume_m3 / (rt60_s * surface_area_m2)
+    alpha_sabine = min(alpha_sabine, 0.999)
+
+    if alpha_sabine <= 0.2:
+        # Sabine is sufficiently accurate
+        alpha = alpha_sabine
+    else:
+        # Eyring inversion — more accurate for high absorption
+        # Eyring: T = 0.161 * V / (-S * ln(1 - alpha))
+        # Inverting: alpha = 1 - exp(-0.161 * V / (T * S))
+        alpha_eyring = 1.0 - np.exp(
+            -0.161 * volume_m3 / (rt60_s * surface_area_m2))
+        alpha_eyring = min(alpha_eyring, 0.999)
+        alpha = alpha_eyring
+
+    R = surface_area_m2 * alpha / (1.0 - alpha)
+    return float(R)
+
+
+def room_constant_formula_used(rt60_s, volume_m3,
+                                surface_area_m2):
+    """
+    Return a string indicating which formula was used for R.
+    Useful for display in the app.
+    """
+    if rt60_s is None or rt60_s <= 0:
+        return 'invalid'
+    alpha_sabine = 0.161 * volume_m3 / (rt60_s * surface_area_m2)
+    alpha_sabine = min(alpha_sabine, 0.999)
+    return 'Sabine' if alpha_sabine <= 0.2 else 'Eyring'
 
 
 # ---------------------------------------------------------------------------
@@ -613,36 +630,11 @@ def estimate_di(direct_energy_db,
     """
     Estimate DI(f) per octave band using classical D/R inversion.
 
-    The classical direct-to-reverberant relationship is:
       D/R = Q * R / (16 * pi * r^2)
+      Q   = (16 * pi * r^2 / R) * (D/R)
+      DI  = 10 * log10(Q)
 
-    Inverting for Q:
-      Q = (16 * pi * r^2 / R) * (D/R)
-
-    DI = 10 * log10(Q)
-
-    Where:
-      D/R  is the measured direct-to-reverberant energy ratio
-      R    is the room constant derived from RT60 via Sabine
-      r    is the source-listener distance
-
-    Direct and reverberant energies are measured from the IR
-    using direct_reverb_energy() which preserves absolute
-    energy ratios. The normalised gated spectrum used for EQ
-    is kept completely separate.
-
-    DI is clipped to [0, 20] dB. No cinema loudspeaker
-    produces DI outside this range:
-      Below 0 dB is physically impossible for a passive
-      radiator in a room.
-      Above 20 dB would require an implausibly narrow beam
-      for a screen-channel system.
-
-    When multiple IR positions are provided the DI is
-    estimated per position and the median is returned.
-    This is more robust than the mean against outliers
-    from boundary positions or reflection hot spots.
-
+    DI is clipped to [0, 20] dB.
     Returns dict {centre_hz: DI_dB}.
     """
     di = {}
@@ -669,8 +661,7 @@ def estimate_di(direct_energy_db,
             di[b] = np.nan
             continue
 
-        di_val = 10.0 * np.log10(Q)
-        di[b] = float(np.clip(di_val, 0.0, 20.0))
+        di[b] = float(np.clip(10.0 * np.log10(Q), 0.0, 20.0))
 
     return di
 
@@ -684,21 +675,15 @@ def estimate_di_from_multiple_irs(ir_list, fs,
                                    late_start_ms=50.0,
                                    bands=OCTAVE_CENTRES):
     """
-    Estimate DI per octave band using median across all IR
+    Estimate DI per octave band using median Q across all IR
     positions.
 
-    For each IR position the D/R ratio is computed from true
-    direct and late energy measurements. Q is derived per
-    position per band. The median Q across positions is used
-    to compute the final DI estimate.
+    For each position the D/R ratio is computed from true direct
+    and late energy. Q is derived per position per band. The
+    median Q is used to compute the final DI estimate.
 
-    Using the median rather than the mean is more robust
-    against outliers from:
-      - Microphone positions near boundaries
-      - Reflection hot spots
-      - Positions near the critical distance where D/R
-        is near unity and small measurement errors have
-        a large effect on the Q estimate
+    Using the median is more robust than the mean against
+    outliers from boundary positions and reflection hot spots.
 
     Returns dict {centre_hz: DI_dB}.
     """
@@ -738,8 +723,8 @@ def estimate_di_from_multiple_irs(ir_list, fs,
         if q_median <= 0:
             di[b_int] = np.nan
             continue
-        di_val = 10.0 * np.log10(q_median)
-        di[b_int] = float(np.clip(di_val, 0.0, 20.0))
+        di[b_int] = float(
+            np.clip(10.0 * np.log10(q_median), 0.0, 20.0))
 
     return di
 
@@ -752,18 +737,12 @@ def gated_direct_field(ir, fs, gate_ms=None):
     """
     Extract the gated direct field magnitude response for EQ use.
 
-    Uses ETC-based reflection detection to set the gate length
-    automatically. The transition frequency rule is ~3/T rather
-    than 2/T — this is more conservative and avoids including
-    early reflections in the direct field estimate at frequencies
-    where the gate is marginal.
-
-    Returns freqs, magnitude (dB normalised to 0 dB peak),
-    and gate_ms_used.
+    Uses ETC-based reflection detection to set the gate length.
+    Transition frequency rule is 3/T (not 2/T).
 
     NOTE: The normalisation here (magnitude -= max) is correct
-    for the EQ path. It must NOT be used for DI estimation.
-    For DI use direct_reverb_energy() which preserves absolute
+    for the EQ path only. Do NOT use for DI estimation.
+    Use direct_reverb_energy() for DI which preserves absolute
     energy ratios.
     """
     direct_idx = detect_direct_arrival(ir, fs)
@@ -800,15 +779,10 @@ def transition_frequency_from_gate(gate_ms_used,
     """
     Derive the transition frequency from the gate length.
 
-    Uses the rule transition_hz ~ 3 / gate_s rather than
-    the previous 2 / gate_s. The factor of 3 is more
-    conservative — it sets the transition one half-octave
-    higher than the 2/T rule, reducing the risk of including
-    early reflections in the direct field estimate near the
-    transition.
-
-    The result is snapped to the nearest octave band centre
-    that is at or above the calculated frequency.
+    Uses 3/T rather than 2/T. The factor of 3 is more
+    conservative and reduces the risk of including early
+    reflections in the direct field estimate near the
+    transition frequency.
     """
     gate_s = gate_ms_used / 1000.0
     if gate_s <= 0:
@@ -825,7 +799,7 @@ def direct_field_at_bands(ir, fs, gate_ms=None,
                            bands=OCTAVE_CENTRES):
     """
     Return the mean direct field level in each octave band
-    (dB, normalised — for EQ path only).
+    (dB, normalised — EQ path only).
     """
     freqs, magnitude, gate_ms_used = gated_direct_field(
         ir, fs, gate_ms)
@@ -846,7 +820,7 @@ def direct_field_at_third_octave_bands(ir, fs, gate_ms=None,
                                         bands=THIRD_OCTAVE_CENTRES):
     """
     Return the mean direct field level in each 1/3-octave band
-    (dB, normalised — for EQ path only).
+    (dB, normalised — EQ path only).
     """
     freqs, magnitude, gate_ms_used = gated_direct_field(
         ir, fs, gate_ms)
@@ -871,7 +845,7 @@ def spatial_average_reverberant(ir_list, fs,
                                   bands=OCTAVE_CENTRES):
     """
     Spatially averaged reverberant field in octave bands.
-    Averaging is performed in the power domain.
+    Averaging in the power domain.
     Used for spectral shape display only — not for DI.
     """
     all_spectra = [reverberant_spectrum(ir, fs, bands)
@@ -889,7 +863,7 @@ def reverberant_spectrum_third_octave(ir, fs,
                                        bands=THIRD_OCTAVE_CENTRES):
     """
     Return the Schroeder initial decay level for each 1/3-octave
-    band. Filter order is reduced to 2 below 80 Hz.
+    band. Filter order reduced to 2 below 80 Hz.
     """
     result = {}
     for b in bands:
@@ -913,7 +887,7 @@ def spatial_average_reverberant_third_octave(
         ir_list, fs, bands=THIRD_OCTAVE_CENTRES):
     """
     Spatially averaged reverberant field in 1/3-octave bands.
-    Averaging is performed in the power domain.
+    Averaging in the power domain.
     """
     all_spectra = [
         reverberant_spectrum_third_octave(ir, fs, bands)
@@ -1056,7 +1030,7 @@ def smooth_third_octave(levels_dict, fraction=3):
     fraction=6 gives 1/6-octave smoothing (used above transition
     frequency per Section 5.5 of the white paper).
 
-    Averaging is performed in the power domain.
+    Averaging in the power domain.
     """
     bands = sorted(levels_dict.keys())
     if len(bands) < 3:
@@ -1155,40 +1129,37 @@ def predict_post_eq_steady_state_third_octave(
 
 
 # ---------------------------------------------------------------------------
-# Physics-based steady-state prediction
+# Steady-state reconstruction from measured fields
 # ---------------------------------------------------------------------------
 
-def predict_steady_state_from_physics(
+def reconstruct_steady_state(
         direct_levels_3rd,
         reverberant_levels_3rd,
-        rt60_per_band,
-        volume_m3,
-        surface_area_m2,
         bands=THIRD_OCTAVE_CENTRES):
     """
-    Predict the steady-state response from physical parameters.
+    Reconstruct the steady-state response by energy-summing the
+    measured direct and reverberant fields.
 
-    Energy-sums the measured direct and reverberant fields to
-    produce the expected steady-state. Used as a verification
-    envelope — if the measured steady-state falls within ±2 dB
-    (100 Hz to 8 kHz) or ±3 dB at the extremes the system is
-    behaving correctly.
+    This is a reconstruction from measurements, not an
+    independent physics-based prediction. It answers:
+    "Given what we measured, what would a steady-state
+    pink noise measurement show?"
+
+    It does NOT independently predict the response from DI,
+    RT60, room geometry, and distance. For that a full
+    predictive model would be required.
 
     Returns:
-      predicted dict {centre_hz: level_db}
+      reconstructed dict {centre_hz: level_db}
       tolerance_upper dict {centre_hz: level_db}
       tolerance_lower dict {centre_hz: level_db}
+
+    Tolerance bands:
+      ±2 dB from 100 Hz to 8 kHz
+      ±3 dB below 100 Hz and above 8 kHz
     """
-    oct_bands_with_rt60 = sorted(
-        b for b in [int(x) for x in OCTAVE_CENTRES]
-        if rt60_per_band.get(b) is not None)
-
-    if not oct_bands_with_rt60:
-        empty = {float(b): np.nan for b in bands}
-        return empty, empty, empty
-
     band_floats = [float(b) for b in bands]
-    predicted = {}
+    reconstructed = {}
     tolerance_upper = {}
     tolerance_lower = {}
 
@@ -1197,7 +1168,7 @@ def predict_steady_state_from_physics(
         r = reverberant_levels_3rd.get(b, np.nan)
 
         if np.isnan(d) or np.isnan(r):
-            predicted[b] = np.nan
+            reconstructed[b] = np.nan
             tolerance_upper[b] = np.nan
             tolerance_lower[b] = np.nan
             continue
@@ -1205,54 +1176,12 @@ def predict_steady_state_from_physics(
         ss = 10.0 * np.log10(
             10.0 ** (d / 10.0) + 10.0 ** (r / 10.0))
 
-        predicted[b] = round(ss, 2)
+        reconstructed[b] = round(ss, 2)
         tol = 2.0 if 100.0 <= b <= 8000.0 else 3.0
         tolerance_upper[b] = round(ss + tol, 2)
         tolerance_lower[b] = round(ss - tol, 2)
 
-    return predicted, tolerance_upper, tolerance_lower
-
-
-def compare_measured_to_predicted(
-        measured_steady_state_3rd,
-        predicted_steady_state_3rd,
-        tolerance_upper_3rd,
-        tolerance_lower_3rd,
-        bands=THIRD_OCTAVE_CENTRES):
-    """
-    Compare a measured steady-state response against the
-    physics-based prediction and tolerance band.
-    """
-    results = {}
-    for b in [float(b) for b in bands]:
-        m = measured_steady_state_3rd.get(b, np.nan)
-        p = predicted_steady_state_3rd.get(b, np.nan)
-        tu = tolerance_upper_3rd.get(b, np.nan)
-        tl = tolerance_lower_3rd.get(b, np.nan)
-
-        if np.isnan(m) or np.isnan(p):
-            results[b] = {
-                'measured': m,
-                'predicted': p,
-                'delta': np.nan,
-                'within_tolerance': None,
-                'tolerance': np.nan}
-            continue
-
-        delta = m - p
-        within = (not np.isnan(tu) and not np.isnan(tl)
-                  and tl <= m <= tu)
-        tol = (tu - p) if not np.isnan(tu) else np.nan
-
-        results[b] = {
-            'measured': round(m, 2),
-            'predicted': round(p, 2),
-            'delta': round(delta, 2),
-            'within_tolerance': within,
-            'tolerance': (round(tol, 2)
-                          if not np.isnan(tol) else np.nan)}
-
-    return results
+    return reconstructed, tolerance_upper, tolerance_lower
 
 
 # ---------------------------------------------------------------------------
@@ -1375,6 +1304,7 @@ def save_csv(direct_levels, reverberant_levels, di_estimates,
              bands=OCTAVE_CENTRES):
     """
     Save full per-band results as CSV.
+    Includes the room constant formula used per band.
     """
     bands_int = [int(b) for b in bands]
     rows = []
