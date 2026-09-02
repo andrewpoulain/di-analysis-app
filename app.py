@@ -17,6 +17,8 @@ from di_analysis import (
     apply_calibration,
     direct_field_at_bands,
     direct_field_at_third_octave_bands,
+    spatial_average_direct_field,
+    spatial_average_direct_field_third_octave,
     direct_reverb_energy_all_bands,
     rt60_per_band_from_irs,
     transition_frequency_from_gate,
@@ -164,10 +166,12 @@ st.header("1. Upload Impulse Response Files")
 st.info(
     "Upload WAV files exported from Smaart. "
     "All files are used for spatial averaging of the "
-    "reverberant field and RT60 estimation. "
-    "Select the reference position file below — this "
-    "file is used for the gated direct field measurement "
-    "and should be the primary mix position IR.")
+    "direct field, reverberant field, and RT60. "
+    "Select the reference position file — this is used "
+    "for gate detection and the reference direct field "
+    "display trace. "
+    "EQ generation uses the spatially averaged direct "
+    "field across all uploaded positions.")
 
 uploaded_files = st.file_uploader(
     "IR WAV files (upload all positions for this channel)",
@@ -188,12 +192,14 @@ if uploaded_files:
         options=filenames,
         index=0,
         help=(
-            "Used for gated direct field measurement. "
-            "Should be the primary mix position IR."))
+            "Used for gate detection and reference "
+            "direct field display. "
+            "EQ is derived from the spatial average "
+            "of all uploaded positions."))
     st.caption(
-        "Direct field from: **" + ref_filename + "**. "
-        "All files contribute to reverberant field "
-        "spatial average and RT60 estimation.")
+        "Reference position: **" + ref_filename + "**. "
+        "EQ derived from spatial average of all "
+        + str(len(uploaded_files)) + " uploaded file(s).")
 
 # ---------------------------------------------------------------------------
 # RT60 overrides
@@ -273,11 +279,16 @@ if (uploaded_files
             "Reference: " + ref_filename)
 
         # ---------------------------------------------------
-        # Direct field — EQ path
+        # Reference direct field — gate detection and
+        # display only. NOT used for EQ generation.
         # ---------------------------------------------------
 
-        direct_levels, gate_ms_used = \
+        ref_direct_levels, gate_ms_used = \
             direct_field_at_bands(
+                ref_ir, ref_fs, gate_ms=gate_ms)
+
+        ref_direct_levels_3rd, _ = \
+            direct_field_at_third_octave_bands(
                 ref_ir, ref_fs, gate_ms=gate_ms)
 
         transition_hz = transition_frequency_from_gate(
@@ -287,6 +298,28 @@ if (uploaded_files
             "Gate: " + str(round(gate_ms_used, 1))
             + " ms — transition: "
             + str(transition_hz) + " Hz (3/T rule)")
+
+        # ---------------------------------------------------
+        # Spatially averaged direct field — used for EQ
+        # ---------------------------------------------------
+
+        avg_direct_levels, _ = \
+            spatial_average_direct_field(
+                irs, ref_fs,
+                gate_ms=gate_ms,
+                bands=OCTAVE_CENTRES)
+
+        avg_direct_levels_3rd, _ = \
+            spatial_average_direct_field_third_octave(
+                irs, ref_fs,
+                gate_ms=gate_ms,
+                bands=THIRD_OCTAVE_CENTRES)
+
+        st.info(
+            "Spatially averaged direct field computed "
+            "from " + str(len(irs)) + " position(s) "
+            "using power averaging. "
+            "EQ corrections derived from spatial average.")
 
         channel_cfg = {
             'name': channel_name,
@@ -339,7 +372,7 @@ if (uploaded_files
             + " ms, 50 ms floor applied where < 50 ms)")
 
         # ---------------------------------------------------
-        # DI estimation
+        # DI estimation — uses all IRs
         # ---------------------------------------------------
 
         di = estimate_di_from_multiple_irs(
@@ -352,42 +385,46 @@ if (uploaded_files
             late_start_ms_val=late_start_val)
 
         # ---------------------------------------------------
-        # EQ corrections against selected target
+        # EQ corrections — from spatially averaged direct
         # ---------------------------------------------------
 
         hf_corr, lf_corr, all_corr = \
             derive_full_eq_target(
-                direct_levels, reverb_levels,
-                reverb_levels, channel_cfg,
+                avg_direct_levels,
+                reverb_levels,
+                reverb_levels,
+                channel_cfg,
                 transition_hz=transition_hz,
                 target_type=target_type)
 
         # ---------------------------------------------------
-        # 1/3 octave analysis
+        # 1/3 octave reverberant field
         # ---------------------------------------------------
-
-        direct_levels_3rd, _ = \
-            direct_field_at_third_octave_bands(
-                ref_ir, ref_fs, gate_ms=gate_ms)
 
         reverb_levels_3rd = \
             spatial_average_reverberant_third_octave(
                 irs, ref_fs)
 
+        # ---------------------------------------------------
+        # Steady-state predictions
+        # ---------------------------------------------------
+
         zero_corr = {
             int(b): 0.0 for b in OCTAVE_CENTRES}
 
+        # Current room — no EQ, using avg direct
         predicted_room_curve_3rd = \
             predict_post_eq_steady_state_third_octave(
-                direct_levels_3rd,
+                avg_direct_levels_3rd,
                 reverb_levels_3rd,
                 zero_corr,
                 transition_hz=transition_hz,
                 half_octave_overlap=True)
 
+        # Post-EQ prediction — using avg direct + corrections
         predicted_post_eq_3rd = \
             predict_post_eq_steady_state_third_octave(
-                direct_levels_3rd,
+                avg_direct_levels_3rd,
                 reverb_levels_3rd,
                 all_corr,
                 transition_hz=transition_hz,
@@ -395,20 +432,21 @@ if (uploaded_files
 
         reconstructed_ss, tol_upper, tol_lower = \
             reconstruct_steady_state(
-                direct_levels_3rd,
+                avg_direct_levels_3rd,
                 reverb_levels_3rd)
 
         # ---------------------------------------------------
         # Reference level and normalisation
+        # Use avg direct 1 kHz as reference
         # ---------------------------------------------------
 
-        ref_level_3rd = direct_levels_3rd.get(
+        ref_level_3rd = avg_direct_levels_3rd.get(
             1000.0, None)
         if (ref_level_3rd is None
                 or np.isnan(ref_level_3rd)):
             available = {
                 k: v
-                for k, v in direct_levels_3rd.items()
+                for k, v in avg_direct_levels_3rd.items()
                 if not np.isnan(v)}
             ref_level_3rd = (
                 available[min(
@@ -422,13 +460,38 @@ if (uploaded_files
                 for b, v in d.items()
                 if not np.isnan(v)}
 
-        direct_3rd_norm = norm(direct_levels_3rd)
+        # Normalise all display traces
+        ref_direct_3rd_norm = norm(ref_direct_levels_3rd)
+        avg_direct_3rd_norm = norm(avg_direct_levels_3rd)
         reverb_3rd_norm = norm(reverb_levels_3rd)
         room_curve_norm = norm(predicted_room_curve_3rd)
         post_eq_norm = norm(predicted_post_eq_3rd)
 
         # ---------------------------------------------------
-        # Target curve for display
+        # EQ correction curve for display
+        # Interpolate all_corr to 1/3-octave resolution
+        # ---------------------------------------------------
+
+        oct_bands_sorted = sorted(
+            b for b in all_corr.keys()
+            if isinstance(b, int))
+        oct_corr_vals = [
+            all_corr[b] for b in oct_bands_sorted]
+        eq_curve_display = {}
+        for b in THIRD_OCTAVE_CENTRES:
+            b_f = float(b)
+            interp_val = float(np.interp(
+                np.log10(b_f),
+                np.log10([float(x)
+                          for x in oct_bands_sorted]),
+                oct_corr_vals,
+                left=oct_corr_vals[0],
+                right=oct_corr_vals[-1]))
+            eq_curve_display[b_f] = interp_val
+
+        # ---------------------------------------------------
+        # Target curve for display — always recomputed
+        # from current target_type
         # ---------------------------------------------------
 
         target_display = get_target_levels(
@@ -446,11 +509,11 @@ if (uploaded_files
             screen_size='small')
 
         third_oct_sorted = sorted(
-            direct_levels_3rd.keys())
+            avg_direct_levels_3rd.keys())
         direct_vals_sorted = [
-            direct_levels_3rd[b]
+            avg_direct_levels_3rd[b]
             for b in third_oct_sorted]
-        ref_direct_level = float(np.interp(
+        ref_direct_level_abs = float(np.interp(
             np.log10(float(XCURVE_REF_HZ)),
             np.log10(third_oct_sorted),
             direct_vals_sorted))
@@ -505,7 +568,8 @@ if (uploaded_files
         # ---------------------------------------------------
 
         df = save_csv(
-            direct_levels, reverb_levels, di,
+            avg_direct_levels,
+            reverb_levels, di,
             rt60_bands, all_corr,
             channel_name, str(out_dir),
             target_type=target_type,
@@ -529,7 +593,7 @@ if (uploaded_files
         export_selected_target_for_smaart(
             target_type=target_type,
             target_levels_3rd=target_display,
-            ref_level_db=ref_direct_level,
+            ref_level_db=ref_direct_level_abs,
             output_path=selected_target_path,
             channel_name=channel_name)
 
@@ -538,7 +602,7 @@ if (uploaded_files
             / (channel_name + "_xcurve_large.txt"))
         export_xcurve_for_smaart(
             xcurve_levels_3rd=xcurve_large,
-            ref_level_db=ref_direct_level,
+            ref_level_db=ref_direct_level_abs,
             output_path=xcurve_large_path,
             screen_size='large')
 
@@ -547,15 +611,46 @@ if (uploaded_files
             / (channel_name + "_xcurve_small.txt"))
         export_xcurve_for_smaart(
             xcurve_levels_3rd=xcurve_small,
-            ref_level_db=ref_direct_level,
+            ref_level_db=ref_direct_level_abs,
             output_path=xcurve_small_path,
             screen_size='small')
 
+        # Parametric EQ export
+        peq_txt_path = (
+            out_dir
+            / (channel_name + "_parametric_eq.txt"))
+        with open(peq_txt_path, 'w') as f:
+            f.write(
+                channel_name + " Parametric EQ — "
+                + room_name + "\n")
+            f.write(
+                "Target: " + target_type + "\n\n")
+            f.write(
+                "Filter  Type        "
+                "Freq (Hz)   Gain (dB)   Q\n")
+            f.write("-" * 52 + "\n")
+            for flt in peq_filters:
+                f.write(
+                    str(flt['number']).ljust(8)
+                    + flt['type'].ljust(12)
+                    + str(flt['frequency_hz']).ljust(12)
+                    + str(flt['gain_db']).ljust(12)
+                    + str(flt['q']) + "\n")
+
+        peq_csv_path = (
+            out_dir
+            / (channel_name + "_parametric_eq.csv"))
+        if peq_filters:
+            pd.DataFrame(peq_filters).to_csv(
+                peq_csv_path, index=False)
+
         st.session_state.update({
-            'direct_3rd_norm': direct_3rd_norm,
+            'ref_direct_3rd_norm': ref_direct_3rd_norm,
+            'avg_direct_3rd_norm': avg_direct_3rd_norm,
             'reverb_3rd_norm': reverb_3rd_norm,
             'room_curve_norm': room_curve_norm,
             'post_eq_norm': post_eq_norm,
+            'eq_curve_display': eq_curve_display,
             'target_display': target_display,
             'target_type': target_type,
             'xcurve_large': xcurve_large,
@@ -573,6 +668,8 @@ if (uploaded_files
                 str(selected_target_path),
             'xcurve_large_path': str(xcurve_large_path),
             'xcurve_small_path': str(xcurve_small_path),
+            'peq_txt_path': str(peq_txt_path),
+            'peq_csv_path': str(peq_csv_path),
             'ref_filename': ref_filename,
             'n_irs': len(irs),
             'listener_distance_m': listener_distance_m,
@@ -588,10 +685,14 @@ if (uploaded_files
 
 if st.session_state.get('analysis_complete'):
 
-    direct_3rd_norm = st.session_state['direct_3rd_norm']
+    ref_direct_3rd_norm = st.session_state[
+        'ref_direct_3rd_norm']
+    avg_direct_3rd_norm = st.session_state[
+        'avg_direct_3rd_norm']
     reverb_3rd_norm = st.session_state['reverb_3rd_norm']
     room_curve_norm = st.session_state['room_curve_norm']
     post_eq_norm = st.session_state['post_eq_norm']
+    eq_curve_display = st.session_state['eq_curve_display']
     target_display = st.session_state['target_display']
     target_type = st.session_state['target_type']
     xcurve_large = st.session_state['xcurve_large']
@@ -612,6 +713,10 @@ if st.session_state.get('analysis_complete'):
         st.session_state['xcurve_large_path'])
     xcurve_small_path = Path(
         st.session_state['xcurve_small_path'])
+    peq_txt_path = Path(
+        st.session_state['peq_txt_path'])
+    peq_csv_path = Path(
+        st.session_state['peq_csv_path'])
     ref_filename = st.session_state['ref_filename']
     n_irs = st.session_state['n_irs']
     listener_distance_m = st.session_state[
@@ -661,75 +766,119 @@ if st.session_state.get('analysis_complete'):
 
         st.markdown("**Trace visibility**")
 
-        vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+        vc1, vc2, vc3, vc4 = st.columns(4)
         with vc1:
-            show_direct = st.checkbox(
-                "Direct field", value=True,
-                key='show_direct')
+            show_ref_direct = st.checkbox(
+                "Reference direct field",
+                value=True,
+                key='show_ref_direct')
+            show_avg_direct = st.checkbox(
+                "Spatially averaged direct field",
+                value=True,
+                key='show_avg_direct')
         with vc2:
             show_reverb = st.checkbox(
                 "Reverberant field", value=True,
                 key='show_reverb')
-        with vc3:
             show_room_curve = st.checkbox(
                 "Current room response", value=True,
                 key='show_room_curve')
-        with vc4:
+        with vc3:
             show_post_eq = st.checkbox(
-                "Predicted post-EQ response", value=True,
+                "Predicted post-EQ response",
+                value=True,
                 key='show_post_eq')
-        with vc5:
+            show_eq_curve = st.checkbox(
+                "EQ correction curve", value=True,
+                key='show_eq_curve')
+        with vc4:
             show_target = st.checkbox(
                 "Selected target", value=True,
                 key='show_target')
 
         st.markdown("**Trace level offsets (dB)**")
         st.caption(
-            "Display-only. Does not affect EQ corrections "
-            "or exported files.")
+            "Display-only. Does not affect EQ "
+            "corrections or exports. "
+            "Target and EQ correction curves have "
+            "no offset — they are always absolute.")
 
-        oc1, oc2, oc3 = st.columns(3)
+        oc1, oc2, oc3, oc4 = st.columns(4)
         with oc1:
-            direct_offset = st.slider(
-                "Direct field offset (dB)",
+            ref_direct_offset = st.slider(
+                "Reference direct field offset (dB)",
                 min_value=-20.0, max_value=20.0,
                 value=0.0, step=0.5,
-                key='direct_offset')
+                key='ref_direct_offset')
         with oc2:
+            avg_direct_offset = st.slider(
+                "Avg direct field offset (dB)",
+                min_value=-20.0, max_value=20.0,
+                value=0.0, step=0.5,
+                key='avg_direct_offset')
+        with oc3:
             reverb_offset = st.slider(
                 "Reverberant field offset (dB)",
                 min_value=-20.0, max_value=20.0,
                 value=0.0, step=0.5,
                 key='reverb_offset')
-        with oc3:
+        with oc4:
             room_curve_offset = st.slider(
-                "Room curve offset (dB)",
+                "Current room response offset (dB)",
                 min_value=-20.0, max_value=20.0,
                 value=0.0, step=0.5,
                 key='room_curve_offset')
 
-    direct_display = {
-        b: v + direct_offset
-        for b, v in direct_3rd_norm.items()}
+        oc5, oc6 = st.columns([1, 3])
+        with oc5:
+            post_eq_offset = st.slider(
+                "Post-EQ response offset (dB)",
+                min_value=-10.0, max_value=10.0,
+                value=0.0, step=0.5,
+                key='post_eq_offset')
+
+    # Apply offsets to display copies
+    ref_direct_display = {
+        b: v + ref_direct_offset
+        for b, v in ref_direct_3rd_norm.items()}
+    avg_direct_display = {
+        b: v + avg_direct_offset
+        for b, v in avg_direct_3rd_norm.items()}
     reverb_display = {
         b: v + reverb_offset
         for b, v in reverb_3rd_norm.items()}
     room_curve_display = {
         b: v + room_curve_offset
         for b, v in room_curve_norm.items()}
+    post_eq_display = {
+        b: v + post_eq_offset
+        for b, v in post_eq_norm.items()}
 
     fig_main = go.Figure()
 
-    if show_direct:
-        label = "Direct field (gated, 1/3 oct)"
-        if direct_offset != 0.0:
-            sign = "+" if direct_offset > 0 else ""
+    if show_ref_direct:
+        label = "Reference direct field (" \
+                + ref_filename + ")"
+        if ref_direct_offset != 0.0:
+            sign = "+" if ref_direct_offset > 0 else ""
             label += ("  " + sign
-                      + str(round(direct_offset, 1))
+                      + str(round(ref_direct_offset, 1))
                       + " dB")
         fig_main.add_trace(make_trace(
-            direct_display, label,
+            ref_direct_display, label,
             'steelblue', width=2))
+
+    if show_avg_direct:
+        label = ("Spatially averaged direct field "
+                 "(" + str(n_irs) + " positions)")
+        if avg_direct_offset != 0.0:
+            sign = "+" if avg_direct_offset > 0 else ""
+            label += ("  " + sign
+                      + str(round(avg_direct_offset, 1))
+                      + " dB")
+        fig_main.add_trace(make_trace(
+            avg_direct_display, label,
+            'magenta', dash='dash', width=2))
 
     if show_reverb:
         label = "Reverberant field (spatially averaged)"
@@ -756,15 +905,26 @@ if st.session_state.get('analysis_complete'):
             width=2, opacity=0.9))
 
     if show_post_eq:
+        label = "Predicted room response after EQ"
+        if post_eq_offset != 0.0:
+            sign = "+" if post_eq_offset > 0 else ""
+            label += ("  " + sign
+                      + str(round(post_eq_offset, 1))
+                      + " dB")
         fig_main.add_trace(make_trace(
-            post_eq_norm,
-            "Predicted room response after EQ",
+            post_eq_display, label,
             'mediumseagreen', dash='solid', width=2))
+
+    if show_eq_curve:
+        fig_main.add_trace(make_trace(
+            eq_curve_display,
+            "EQ correction (no offset)",
+            'mediumpurple', dash='dashdot', width=1.5))
 
     if show_target:
         fig_main.add_trace(make_trace(
             target_display,
-            "Target: " + target_type,
+            "Target: " + target_type + " (no offset)",
             'darkorange', dash='dashdot', width=2))
 
     fig_main.update_layout(
@@ -784,31 +944,36 @@ if st.session_state.get('analysis_complete'):
             range=[np.log10(20), np.log10(20000)]),
         yaxis=dict(
             title='Level (dB, normalised at 1 kHz)',
-            range=[-25, 15]),
+            range=[-30, 15]),
         legend=dict(
             orientation='h',
             yanchor='bottom',
-            y=-0.40,
+            y=-0.45,
             xanchor='left',
             x=0),
-        height=580,
+        height=620,
         hovermode='x unified')
 
     st.plotly_chart(fig_main, width='stretch')
 
     st.caption(
-        "Direct field (blue): gated IR at reference "
-        "position (" + ref_filename + "), "
-        "1/6-octave smoothed above transition. "
-        "Reverberant field (red): spatially averaged "
+        "Reference direct (blue): gated IR at reference "
+        "position, 1/6-oct smoothed above transition. "
+        "Spatially averaged direct (magenta dashed): "
+        "power average of gated direct field across all "
+        "positions — used for EQ generation. "
+        "Reverberant (red dashed): spatially averaged "
         "Schroeder decay. "
-        "Current room response (grey): energy sum of "
-        "direct and reverberant, no EQ. "
-        "Predicted post-EQ (green): room response after "
-        "applying calculated corrections. "
-        "Target (orange): selected monitoring target. "
-        "All traces normalised to 0 dB at 1 kHz. "
-        "Offsets are display-only.")
+        "Current room (grey): energy sum, no EQ. "
+        "Post-EQ (green): predicted room response after "
+        "EQ corrections applied. "
+        "EQ correction (purple dash-dot): octave band "
+        "corrections interpolated to 1/3-octave. "
+        "Target (orange dash-dot): selected monitoring "
+        "target. "
+        "All measurement traces normalised to 0 dB at "
+        "1 kHz. Target and EQ correction are absolute "
+        "and have no offset.")
 
     # ---------------------------------------------------------------
     # Section 3: RT60
@@ -823,7 +988,6 @@ if st.session_state.get('analysis_complete'):
         if isinstance(b, int)
         and rt60_bands[b] is not None)
 
-    # Measured RT60 trace
     measured_rt60_dict = rt60_bands.get('_measured', {})
     meas_x = []
     meas_y = []
@@ -843,7 +1007,6 @@ if st.session_state.get('analysis_complete'):
                 dash='dot'),
             marker=dict(size=7)))
 
-    # Effective RT60 trace
     eff_x = [float(b) for b in rt60_bands_sorted]
     eff_y = [rt60_bands[b] for b in rt60_bands_sorted]
 
@@ -873,21 +1036,19 @@ if st.session_state.get('analysis_complete'):
 
     st.plotly_chart(fig_rt60, width='stretch')
 
-    # RT60 detail table
     if rt60_table_rows:
         with st.expander(
                 "RT60 detail table", expanded=True):
             rt60_df = pd.DataFrame(rt60_table_rows)
             st.dataframe(rt60_df, hide_index=True)
             st.caption(
-                "Measured RT60: raw calculated value "
-                "before fallback or override. "
+                "Measured RT60: raw value before "
+                "fallback or override. "
                 "Effective RT60: value used in all "
                 "calculations. "
-                "Source: Measured = direct calculation, "
-                "HF Fallback = substituted from lower "
-                "band, Manual Override = user-entered. "
-                "Sabine used when alpha <= 0.2, "
+                "Source: Measured / HF Fallback / "
+                "Manual Override. "
+                "Sabine when alpha <= 0.2, "
                 "Eyring when alpha > 0.2.")
 
     # ---------------------------------------------------------------
@@ -951,30 +1112,43 @@ if st.session_state.get('analysis_complete'):
 
     st.header("5. Parametric EQ Filters")
 
+    col_metric1, col_metric2 = st.columns(2)
+    with col_metric1:
+        st.metric(
+            "Filters generated",
+            str(len(peq_filters)))
+    with col_metric2:
+        st.metric(
+            "Target",
+            target_type)
+
     st.caption(
-        "Filter recommendations derived from octave band "
-        "EQ corrections against the selected target: "
+        "Derived from spatially averaged direct field "
+        "EQ corrections against target: "
         + target_type + ". "
-        "Adjacent bands with similar corrections are "
+        "Adjacent bands with similar corrections "
         "collapsed into single filters. "
-        "Maximum 10 filters per channel.")
+        "Maximum 10 filters per channel. "
+        "Suitable for Lake, Q-SYS, XTA, "
+        "Dolby CP950, Trinnov.")
 
     if peq_filters:
-        peq_df = pd.DataFrame(peq_filters)
-        peq_df = peq_df.rename(columns={
-            'number': 'Filter',
-            'type': 'Type',
-            'frequency_hz': 'Frequency (Hz)',
-            'gain_db': 'Gain (dB)',
-            'q': 'Q',
-        })
-        st.dataframe(peq_df, hide_index=True)
-        st.caption(
-            "Bell Q=1.0 (single band), Q=0.7 (two bands), "
-            "Q=0.5 (three or more bands). "
-            "Shelf Q=0.707. "
-            "Suitable for Lake, Q-SYS, XTA, "
-            "Dolby CP950, Trinnov.")
+        peq_display = []
+        for flt in peq_filters:
+            bw_octaves = (
+                round(1.0 / flt['q'], 2)
+                if flt['q'] > 0 else None)
+            peq_display.append({
+                'Filter': flt['number'],
+                'Type': flt['type'],
+                'Frequency (Hz)': flt['frequency_hz'],
+                'Gain (dB)': flt['gain_db'],
+                'Q': flt['q'],
+                'Bandwidth (oct)': bw_octaves,
+            })
+        st.dataframe(
+            pd.DataFrame(peq_display),
+            hide_index=True)
     else:
         st.info(
             "No significant corrections required — "
@@ -1007,10 +1181,9 @@ if st.session_state.get('analysis_complete'):
 
     st.caption(
         "Reference position: " + ref_filename
-        + " (direct field measurement). "
-        "All " + str(n_irs)
-        + " file(s) used for reverberant field "
-        "spatial average and RT60. "
+        + " (gate detection and reference display). "
+        "EQ derived from spatial average of all "
+        + str(n_irs) + " position(s). "
         "Listener distance: "
         + str(round(listener_distance_m, 1))
         + " m (2/3 room length). "
@@ -1035,13 +1208,13 @@ if st.session_state.get('analysis_complete'):
     st.caption(
         "Import into Smaart via "
         "Options -> Reference Curves -> Import. "
-        "All curves anchored to measured direct field "
-        "level at 1 kHz.")
+        "All curves anchored to spatially averaged "
+        "direct field level at 1 kHz.")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    dl_col1, dl_col2, dl_col3, dl_col4 = st.columns(4)
 
     if eq_target_path.exists():
-        with col1:
+        with dl_col1:
             st.download_button(
                 label="EQ target curve (Smaart)",
                 data=eq_target_path.read_bytes(),
@@ -1052,7 +1225,7 @@ if st.session_state.get('analysis_complete'):
                     "Use as reference in Smaart."))
 
     if selected_target_path.exists():
-        with col2:
+        with dl_col2:
             st.download_button(
                 label="Selected target (Smaart)",
                 data=selected_target_path.read_bytes(),
@@ -1063,7 +1236,7 @@ if st.session_state.get('analysis_complete'):
                     + target_type))
 
     if xcurve_large_path.exists():
-        with col3:
+        with dl_col3:
             st.download_button(
                 label="X-curve large room (Smaart)",
                 data=xcurve_large_path.read_bytes(),
@@ -1074,7 +1247,7 @@ if st.session_state.get('analysis_complete'):
                     "Flat to 2 kHz, -3 dB/oct above."))
 
     if xcurve_small_path.exists():
-        with col4:
+        with dl_col4:
             st.download_button(
                 label="X-curve small room (Smaart)",
                 data=xcurve_small_path.read_bytes(),
@@ -1084,10 +1257,15 @@ if st.session_state.get('analysis_complete'):
                     "SMPTE RP 200. "
                     "Flat to 4 kHz, -3 dB/oct above."))
 
+    st.subheader("Data Exports")
+
     csv_path = eq_target_path.parent / (
         channel_name + "_results.csv")
+
+    dl_col5, dl_col6, dl_col7 = st.columns(3)
+
     if csv_path.exists():
-        with col5:
+        with dl_col5:
             st.download_button(
                 label="Results CSV",
                 data=csv_path.read_bytes(),
@@ -1098,6 +1276,28 @@ if st.session_state.get('analysis_complete'):
                     "direct field, reverberant field, "
                     "RT60, DI, EQ corrections, and "
                     "predicted post-EQ response."))
+
+    if peq_txt_path.exists():
+        with dl_col6:
+            st.download_button(
+                label="Parametric EQ (TXT)",
+                data=peq_txt_path.read_bytes(),
+                file_name=peq_txt_path.name,
+                mime="text/plain",
+                help=(
+                    "Parametric EQ filter list "
+                    "as plain text."))
+
+    if peq_csv_path.exists():
+        with dl_col7:
+            st.download_button(
+                label="Parametric EQ (CSV)",
+                data=peq_csv_path.read_bytes(),
+                file_name=peq_csv_path.name,
+                mime="text/csv",
+                help=(
+                    "Parametric EQ filter list "
+                    "as CSV."))
 
     shutil.rmtree(
         eq_target_path.parent.parent,
